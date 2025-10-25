@@ -13,12 +13,11 @@ async function main() {
 
   contract.on('Executed', async (id, entryX6, evt) => {
     try {
-      await handleExecutedEvent({ id, entryX6 });
-      logInfo(
-        TAG,
-        `stored id=${id} entryX6=${entryX6}`,
-        `@ block=${evt.blockNumber} tx=${evt.transactionHash} logIndex=${evt.logIndex}`
+      await handleExecutedEvent(
+        { id, entryX6 },
+        { txHash: evt.transactionHash, blockNum: evt.blockNumber }
       );
+      logInfo(TAG, `stored id=${id} entryX6=${entryX6} @ block=${evt.blockNumber} tx=${evt.transactionHash} logIndex=${evt.logIndex}`);
     } catch (e) {
       logErr(TAG, 'handleExecutedEvent failed:', e.message || e);
     }
