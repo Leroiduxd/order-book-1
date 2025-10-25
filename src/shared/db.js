@@ -1,333 +1,214 @@
-import { supabase } from './supabase.js';
+// src/shared/db.js
+import { query } from './pg.js';
 import { logInfo, logErr } from './logger.js';
 
-/* =========================================================
-   Assets cache (tick/lot)
-========================================================= */
+/* ============================
+   Helpers BigInt & maths
+=============================== */
+const BI = (x) => BigInt(x);
+const divFloor = (a, b) => a / b;                 // BigInt floor
+const mulDivFloor = (a, b, c) => (a * b) / c;     // (a*b)/c en BigInt
+
+function toInt(x) { return Number(x); }
+function toStr(x) { return String(x); }
+
+/* ============================
+   Assets (tick/lot)
+=============================== */
 const assetCache = new Map();
+/** Retourne { id, tick_x6, lot_num, lot_den } */
 export async function getAsset(asset_id) {
-  if (assetCache.has(asset_id)) return assetCache.get(asset_id);
-  const { data, error } = await supabase
-    .from('assets')
-    .select('asset_id, tick_size_usd6, lot_num, lot_den')
-    .eq('asset_id', asset_id)
-    .maybeSingle();
-  if (error) throw error;
-  if (!data) throw new Error(`Asset ${asset_id} introuvable dans DB (table assets)`);
-  assetCache.set(asset_id, data);
-  return data;
+  const k = Number(asset_id);
+  if (assetCache.has(k)) return assetCache.get(k);
+  const { rows } = await query(
+    `select id, tick_x6, lot_num, lot_den from public.assets where id = $1`,
+    [k]
+  );
+  if (!rows.length) throw new Error(`Asset ${k} introuvable (table assets)`);
+  assetCache.set(k, rows[0]);
+  return rows[0];
 }
 
-/* =========================================================
-   Helpers BigInt & maths
-========================================================= */
-const BI = (x) => BigInt(x);
-function divFloor(a, b) { return a / b; }                 // BigInt floor
-function mulDivFloor(a, b, c) { return (a * b) / c; }     // (a*b)/c en BigInt
-
-/* =========================================================
+/* ============================
    Notional / Margin
-========================================================= */
+=============================== */
 function computeNotionalAndMargin({ entry_x6, lots, leverage_x, lot_num, lot_den }) {
   const entry   = BI(entry_x6);
   const lotsBI  = BI(lots);
-  const lotNum  = BI(lot_num);
-  const lotDen  = BI(lot_den);
+  const lotNum  = BI(lot_num ?? 1);
+  const lotDen  = BI(lot_den ?? 1);
   const lev     = BI(leverage_x);
 
   const qty_num = lotsBI * lotNum;  // numérateur de qty_base
   const qty_den = lotDen;           // dénominateur
 
-  const notional = mulDivFloor(entry, qty_num, qty_den);
+  const notional = mulDivFloor(entry, qty_num, qty_den); // USDx6
   const margin   = divFloor(notional, lev);
 
   return { notional_usd6: notional.toString(), margin_usd6: margin.toString() };
 }
 
-/* =========================================================
-   Indexation des stops (SL/TP/LIQ) avec UPSERT
-========================================================= */
-async function indexStops({ asset_id, position_id, sl_x6, tp_x6, liq_x6 }) {
-  const asset = await getAsset(Number(asset_id));
-  const tick  = BI(asset.tick_size_usd6);
-
-  const rows = [];
-  if (Number(sl_x6)  !== 0) rows.push({ px: BI(sl_x6),  type: 1 }); // SL
-  if (Number(tp_x6)  !== 0) rows.push({ px: BI(tp_x6),  type: 2 }); // TP
-  if (Number(liq_x6) !== 0) rows.push({ px: BI(liq_x6), type: 3 }); // LIQ
-
-  for (const r of rows) {
-    const bucket_id = divFloor(r.px, tick).toString();
-    const { error } = await supabase
-      .from('stop_buckets')
-      .upsert(
-        {
-          asset_id: Number(asset_id),
-          bucket_id,
-          position_id: Number(position_id),
-          stop_type: r.type
-        },
-        { onConflict: 'asset_id,bucket_id,position_id,stop_type' }
-      );
-    if (error) {
-      if (error.code === '23505') {
-        // déjà présent: pas grave
-        logInfo('DB', `stop_buckets duplicate ignored asset=${asset_id} bucket=${bucket_id} pos=${position_id} type=${r.type}`);
-      } else {
-        logErr('DB', `stop_buckets upsert failed asset=${asset_id} bucket=${bucket_id} pos=${position_id} type=${r.type}:`, error.message || error);
-        throw error;
-      }
-    }
-  }
+/* ============================
+   Mappers d'état / raisons
+=============================== */
+function stateNumToEnum(stateNum) {
+  // 0=ORDER, 1=OPEN  (dans ton ancien code)
+  return Number(stateNum) === 0 ? 'ORDER' : 'OPEN';
 }
 
-/* =========================================================
-   OPENED (state=0=ORDER, state=1=OPEN)
-   - positions: upsert
-   - state=0: order_buckets upsert (target)
-   - state=1: stop_buckets upsert (SL/TP/LIQ)
-========================================================= */
-export async function upsertOpenedEvent(ev) {
+// remove_reason : 'CANCELLED' | 'MARKET' | 'SL' | 'TP' | 'LIQ'
+function reasonNumToEnum(reason) {
+  // Adapte ici si ton event reason est numérique:
+  // 0= CANCELLED, 1=MARKET, 2=SL, 3=TP, 4=LIQ (exemple)
+  const m = {
+    0: 'CANCELLED',
+    1: 'MARKET',
+    2: 'SL',
+    3: 'TP',
+    4: 'LIQ',
+  };
+  const r = m[Number(reason)];
+  if (!r) throw new Error(`Unknown remove reason: ${reason}`);
+  return r;
+}
+
+/* ============================
+   OPENED
+   - appelle public.ingest_opened(...)
+=============================== */
+export async function upsertOpenedEvent(ev, meta = {}) {
   const {
     id, state, asset, longSide, lots,
     entryOrTargetX6, slX6, tpX6, liqX6,
     trader, leverageX
   } = ev;
 
-  const assetRow = await getAsset(Number(asset));
+  const st = stateNumToEnum(state);
+  const a  = await getAsset(Number(asset));
 
-  let notional_usd6 = null;
-  let margin_usd6   = null;
+  // Pour ORDER et OPEN on calcule une marge sur le prix "entryOrTargetX6"
+  // (utile pour pré-allocations / cohérence)
+  const { margin_usd6 } = computeNotionalAndMargin({
+    entry_x6: entryOrTargetX6,
+    lots,
+    leverage_x: leverageX,
+    lot_num: a.lot_num,
+    lot_den: a.lot_den
+  });
 
-  if (Number(state) === 1) {
-    // position ouverte immédiatement (market)
-    const calc = computeNotionalAndMargin({
-      entry_x6: entryOrTargetX6,
-      lots,
-      leverage_x: leverageX,
-      lot_num: assetRow.lot_num,
-      lot_den: assetRow.lot_den
-    });
-    notional_usd6 = calc.notional_usd6;
-    margin_usd6   = calc.margin_usd6;
-  }
+  // Appel de la fonction SQL : ingest_opened
+  await query(
+    `select public.ingest_opened(
+       $1::int8,  -- _id
+       $2::text,  -- _owner_addr
+       $3::int4,  -- _asset_id
+       $4::bool,  -- _long_side
+       $5::int2,  -- _lots
+       $6::int2,  -- _leverage_x
+       $7::int8,  -- _margin_usd6
+       $8::trade_state,      -- _state ('ORDER'|'OPEN')
+       $9::int8,  -- _entry_or_target_x6
+       $10::int8, -- _sl_x6
+       $11::int8, -- _tp_x6
+       $12::int8, -- _liq_x6
+       $13::text, -- _tx_hash
+       $14::bigint -- _block_num
+     )`,
+    [
+      toInt(id),
+      toStr(trader),
+      toInt(asset),
+      Boolean(longSide),
+      toInt(lots),
+      toInt(leverageX),
+      BigInt(margin_usd6).toString(),
+      st,
+      toStr(entryOrTargetX6),
+      toStr(slX6 ?? 0),
+      toStr(tpX6 ?? 0),
+      toStr(liqX6 ?? 0),
+      meta.txHash ?? null,
+      meta.blockNum ?? null
+    ]
+  );
 
-  // 1) UPSERT position (idempotent)
-  const upsertPayload = {
-    id: Number(id),
-    state: Number(state),
-    asset_id: Number(asset),
-    trader_addr: String(trader),
-    long_side: Boolean(longSide),
-    lots: Number(lots),
-    leverage_x: Number(leverageX),
-    entry_x6: Number(state) === 1 ? String(entryOrTargetX6) : null,
-    target_x6: Number(state) === 0 ? String(entryOrTargetX6) : null,
-    sl_x6: String(slX6),
-    tp_x6: String(tpX6),
-    liq_x6: String(liqX6),
-    notional_usd6,
-    margin_usd6
-  };
-
-  {
-    const { error } = await supabase
-      .from('positions')
-      .upsert(upsertPayload, { onConflict: 'id' });
-    if (error) throw error;
-  }
-
-  // 2) Index
-  if (Number(state) === 0) {
-    // ORDER -> index target dans order_buckets (UPSERT)
-    const tick   = BI(assetRow.tick_size_usd6);
-    const price  = BI(entryOrTargetX6);
-    const bucket = divFloor(price, tick).toString();
-
-    const { error } = await supabase
-      .from('order_buckets')
-      .upsert(
-        {
-          asset_id: Number(asset),
-          bucket_id: bucket,
-          position_id: Number(id)
-        },
-        { onConflict: 'asset_id,bucket_id,position_id' }
-      );
-    if (error) throw error;
-  } else {
-    // OPEN -> indexer SL/TP/LIQ (clean préalable pour cohérence)
-    const { error: delErr } = await supabase
-      .from('stop_buckets')
-      .delete()
-      .eq('position_id', Number(id));
-    if (delErr) throw delErr;
-
-    await indexStops({
-      asset_id: Number(asset),
-      position_id: Number(id),
-      sl_x6: slX6,
-      tp_x6: tpX6,
-      liq_x6: liqX6
-    });
-  }
-
-  logInfo('DB', `Opened upserted id=${id} state=${state} (indexed=${Number(state)===0?'order':'stops'})`);
+  logInfo('DB', `ingest_opened ok id=${id} state=${st} asset=${asset} lots=${lots}`);
 }
 
-/* =========================================================
-   EXECUTED (ORDER -> OPEN)
-   - update position: state=1, entry_x6, notional/margin
-   - delete order_buckets
-   - (re)index SL/TP/LIQ (upsert)
-========================================================= */
-export async function handleExecutedEvent(ev) {
+/* ============================
+   EXECUTED
+=============================== */
+export async function handleExecutedEvent(ev, meta = {}) {
   const { id, entryX6 } = ev;
 
-  // Lire position pour lots, leverage, asset, stops actuels
-  const { data: pos, error: readErr } = await supabase
-    .from('positions')
-    .select('asset_id, lots, leverage_x, sl_x6, tp_x6, liq_x6')
-    .eq('id', Number(id))
-    .maybeSingle();
-  if (readErr) throw readErr;
-  if (!pos) throw new Error(`Position ${id} introuvable pour Executed`);
+  await query(
+    `select public.ingest_executed(
+       $1::int8,  -- _id
+       $2::int8,  -- _entry_x6
+       $3::text,  -- _tx_hash
+       $4::bigint -- _block_num
+     )`,
+    [
+      toInt(id),
+      toStr(entryX6),
+      meta.txHash ?? null,
+      meta.blockNum ?? null
+    ]
+  );
 
-  const assetRow = await getAsset(Number(pos.asset_id));
-  const calc = computeNotionalAndMargin({
-    entry_x6: entryX6,
-    lots: pos.lots,
-    leverage_x: pos.leverage_x,
-    lot_num: assetRow.lot_num,
-    lot_den: assetRow.lot_den
-  });
-
-  // 1) Update position
-  {
-    const { error } = await supabase
-      .from('positions')
-      .update({
-        state: 1,
-        entry_x6: String(entryX6),
-        notional_usd6: calc.notional_usd6,
-        margin_usd6:   calc.margin_usd6
-      })
-      .eq('id', Number(id));
-    if (error) throw error;
-  }
-
-  // 2) Retirer des order_buckets
-  {
-    const { error } = await supabase
-      .from('order_buckets')
-      .delete()
-      .eq('position_id', Number(id));
-    if (error) throw error;
-  }
-
-  // 3) (Ré)indexer SL/TP/LIQ (upsert)
-  {
-    const { error } = await supabase
-      .from('stop_buckets')
-      .delete()
-      .eq('position_id', Number(id));
-    if (error) throw error;
-  }
-
-  await indexStops({
-    asset_id: Number(pos.asset_id),
-    position_id: Number(id),
-    sl_x6: pos.sl_x6 ?? 0,
-    tp_x6: pos.tp_x6 ?? 0,
-    liq_x6: pos.liq_x6 ?? 0
-  });
-
-  logInfo('DB', `Executed applied id=${id} entryX6=${entryX6} (order->stops indexed)`);
+  logInfo('DB', `ingest_executed ok id=${id} entryX6=${entryX6}`);
 }
 
-/* =========================================================
+/* ============================
    STOPS UPDATED
-   - update SL/TP (pas LIQ)
-   - delete stop_buckets (types 1,2), conserve LIQ (3)
-   - re-index SL/TP (upsert)
-========================================================= */
-export async function handleStopsUpdatedEvent(ev) {
+=============================== */
+export async function handleStopsUpdatedEvent(ev, meta = {}) {
   const { id, slX6, tpX6 } = ev;
 
-  // Lire position pour asset_id & liq_x6
-  const { data: pos, error: posErr } = await supabase
-    .from('positions')
-    .select('asset_id, liq_x6')
-    .eq('id', Number(id))
-    .maybeSingle();
-  if (posErr) throw posErr;
-  if (!pos) throw new Error(`Position ${id} introuvable pour StopsUpdated`);
+  await query(
+    `select public.ingest_stops_updated(
+       $1::int8,  -- _id
+       $2::int8,  -- _sl_x6
+       $3::int8,  -- _tp_x6
+       $4::text,  -- _tx_hash
+       $5::bigint -- _block_num
+     )`,
+    [
+      toInt(id),
+      toStr(slX6 ?? 0),
+      toStr(tpX6 ?? 0),
+      meta.txHash ?? null,
+      meta.blockNum ?? null
+    ]
+  );
 
-  // 1) Update SL/TP
-  {
-    const { error } = await supabase
-      .from('positions')
-      .update({
-        sl_x6: String(slX6),
-        tp_x6: String(tpX6)
-      })
-      .eq('id', Number(id));
-    if (error) throw error;
-  }
-
-  // 2) Supprimer uniquement SL/TP (1,2), conserver LIQ (3)
-  {
-    const { error } = await supabase
-      .from('stop_buckets')
-      .delete()
-      .eq('position_id', Number(id))
-      .in('stop_type', [1, 2]);
-    if (error) throw error;
-  }
-
-  // 3) Réindexer SL/TP (upsert)
-  await indexStops({
-    asset_id: Number(pos.asset_id),
-    position_id: Number(id),
-    sl_x6: slX6,
-    tp_x6: tpX6,
-    liq_x6: 0 // LIQ conservé
-  });
-
-  logInfo('DB', `StopsUpdated id=${id} slX6=${slX6} tpX6=${tpX6} (LIQ conservé)`);
+  logInfo('DB', `ingest_stops_updated ok id=${id} sl=${slX6} tp=${tpX6}`);
 }
 
-/* =========================================================
-   REMOVED (fermeture ou annulation)
-   - update position: state=2, close_reason, exec_x6, pnl_usd6
-   - delete tous les stops
-========================================================= */
-export async function handleRemovedEvent(ev) {
+/* ============================
+   REMOVED
+=============================== */
+export async function handleRemovedEvent(ev, meta = {}) {
   const { id, reason, execX6, pnlUsd6 } = ev;
 
-  // 1) Fermer la position
-  {
-    const { error } = await supabase
-      .from('positions')
-      .update({
-        state: 2,
-        close_reason: Number(reason),
-        exec_x6: String(execX6),
-        pnl_usd6: String(pnlUsd6)
-      })
-      .eq('id', Number(id));
-    if (error) throw error;
-  }
+  await query(
+    `select public.ingest_removed(
+       $1::int8,             -- _id
+       $2::remove_reason,    -- _reason
+       $3::int8,             -- _exec_x6
+       $4::numeric,          -- _pnl_usd6
+       $5::text,             -- _tx_hash
+       $6::bigint            -- _block_num
+     )`,
+    [
+      toInt(id),
+      reasonNumToEnum(reason),
+      toStr(execX6 ?? 0),
+      toStr(pnlUsd6 ?? 0),
+      meta.txHash ?? null,
+      meta.blockNum ?? null
+    ]
+  );
 
-  // 2) Supprimer tous les stops (SL/TP/LIQ)
-  {
-    const { error } = await supabase
-      .from('stop_buckets')
-      .delete()
-      .eq('position_id', Number(id));
-    if (error) throw error;
-  }
-
-  logInfo('DB', `Removed id=${id} reason=${reason} execX6=${execX6} pnlUsd6=${pnlUsd6}`);
+  logInfo('DB', `ingest_removed ok id=${id} reason=${reason} exec=${execX6} pnl=${pnlUsd6}`);
 }
-
