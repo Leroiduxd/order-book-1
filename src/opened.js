@@ -15,16 +15,11 @@ async function main() {
     'Opened',
     async (id, state, asset, longSide, lots, entryOrTargetX6, slX6, tpX6, liqX6, trader, leverageX, evt) => {
       try {
-        await upsertOpenedEvent({
-          id, state, asset, longSide, lots,
-          entryOrTargetX6, slX6, tpX6, liqX6,
-          trader, leverageX
-        });
-        logInfo(
-          TAG,
-          `stored id=${id} state=${state} asset=${asset} lots=${lots}`,
-          `@ block=${evt.blockNumber} tx=${evt.transactionHash} logIndex=${evt.logIndex}`
+        await upsertOpenedEvent(
+          { id, state, asset, longSide, lots, entryOrTargetX6, slX6, tpX6, liqX6, trader, leverageX },
+          { txHash: evt.transactionHash, blockNum: evt.blockNumber }
         );
+        logInfo(TAG, `stored id=${id} state=${state} asset=${asset} lots=${lots} @ block=${evt.blockNumber} tx=${evt.transactionHash} logIndex=${evt.logIndex}`);
       } catch (e) {
         logErr(TAG, 'upsertOpenedEvent failed:', e.message || e);
       }
