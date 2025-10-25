@@ -1,54 +1,37 @@
 import 'dotenv/config';
 import express from 'express';
-import { supabase } from './shared/supabase.js';
+import { query } from './shared/pg.js';
 import { logInfo, logErr } from './shared/logger.js';
 
 const app = express();
 const PORT = Number(process.env.PORT || 8080);
 
-/** Parse string price (e.g. "108910.01") to x6 BigInt safely (no FP). */
+/** Parse "108910.01" -> x6 BigInt string (sans float) */
 function priceStrToX6(str) {
   if (typeof str !== 'string') str = String(str);
-  const parts = str.split('.');
-  const intPart = parts[0].replace(/^0+/, '') || '0';
-  const fracPart = (parts[1] || '').padEnd(6, '0').slice(0, 6); // 6 decimals
   const sign = str.trim().startsWith('-') ? '-' : '';
-  const digits = (intPart.replace('-', '') || '0') + fracPart;
-  return BigInt(sign + digits);
+  const [i, f = ''] = str.replace('-', '').split('.');
+  const intPart = (i || '0').replace(/^0+/, '') || '0';
+  const fracPart = f.padEnd(6, '0').slice(0, 6);
+  return sign + intPart + fracPart;
 }
 
-/** GET /trader/:addr/ids
- *  Retourne seulement les IDs, classés par statut:
- *  - orders (state=0)
- *  - open (state=1)
- *  - cancelled (state=2 & close_reason=0)
- *  - closed (state=2 & close_reason IN 1..4)
- */
+/** GET /trader/:addr/ids  (équivalent à avant) */
 app.get('/trader/:addr/ids', async (req, res) => {
   try {
-    const addr = String(req.params.addr || '').toLowerCase();
-    if (!addr.match(/^0x[a-f0-9]{40}$/)) {
-      return res.status(400).json({ error: 'invalid address (lowercase expected)' });
+    const addr = String(req.params.addr || '');
+    if (!addr.match(/^0x[a-fA-F0-9]{40}$/)) {
+      return res.status(400).json({ error: 'invalid address' });
     }
-
-    // Récupérer IDs en 3 requêtes (simples et lisibles)
-    const [{ data: orders }, { data: open }, { data: closedAll }, { data: cancelled },] = await Promise.all([
-      supabase.from('positions').select('id').eq('trader_addr_lc', addr).eq('state', 0),
-      supabase.from('positions').select('id').eq('trader_addr_lc', addr).eq('state', 1),
-      supabase.from('positions').select('id, close_reason').eq('trader_addr_lc', addr).eq('state', 2),
-      supabase.from('positions').select('id').eq('trader_addr_lc', addr).eq('state', 2).eq('close_reason', 0),
-    ]);
-
-    const closed = (closedAll || [])
-      .filter((r) => r.close_reason !== null && r.close_reason !== 0)
-      .map((r) => r.id);
-
+    const { rows } = await query(`select public.get_trader_ids_grouped($1::text) as data`, [addr]);
+    const data = rows?.[0]?.data || {};
+    // Harmonisation avec ton ancien shape
     res.json({
       trader: addr,
-      orders: (orders || []).map((r) => r.id),
-      open: (open || []).map((r) => r.id),
-      cancelled: (cancelled || []).map((r) => r.id),
-      closed
+      orders: data.order ?? [],
+      open: data.open ?? [],
+      cancelled: data.cancelled ?? [],
+      closed: data.closed ?? []
     });
   } catch (e) {
     logErr('API', e);
@@ -56,9 +39,7 @@ app.get('/trader/:addr/ids', async (req, res) => {
   }
 });
 
-/** GET /positions?ids=1,2,3
- *  Retourne les données d'une ou plusieurs positions.
- */
+/** GET /positions?ids=1,2,3  -> renvoie lignes complètes depuis trades */
 app.get('/positions', async (req, res) => {
   try {
     const idsStr = String(req.query.ids || '').trim();
@@ -67,42 +48,31 @@ app.get('/positions', async (req, res) => {
     const ids = idsStr.split(',').map((s) => Number(s.trim())).filter((n) => Number.isInteger(n) && n >= 0);
     if (!ids.length) return res.status(400).json({ error: 'no valid ids' });
 
-    const { data, error } = await supabase
-      .from('positions')
-      .select(`
-        id, state, asset_id, trader_addr_lc, long_side, lots, leverage_x,
-        entry_x6, target_x6, sl_x6, tp_x6, liq_x6,
-        close_reason, exec_x6, pnl_usd6,
-        notional_usd6, margin_usd6, created_at, updated_at
-      `)
-      .in('id', ids);
-    if (error) throw error;
-
-    res.json(data || []);
+    const { rows } = await query(
+      `select * from public.trades where id = any($1::int8[])`,
+      [ids]
+    );
+    res.json(rows || []);
   } catch (e) {
     logErr('API', e);
     res.status(500).json({ error: 'internal_error' });
   }
 });
 
-/** Helper: calcule bucket_id pour (asset_id, price) */
+/** Helper: calcule bucket_id pour (asset, priceStr) -> en appelant price_to_bucket */
 async function computeBucketId(asset_id, priceStr) {
-  const priceX6 = priceStrToX6(String(priceStr));
-  const { data: asset, error } = await supabase
-    .from('assets')
-    .select('tick_size_usd6')
-    .eq('asset_id', Number(asset_id))
-    .maybeSingle();
-  if (error) throw error;
-  if (!asset) throw new Error('asset_not_found');
-  const tick = BigInt(asset.tick_size_usd6);
-  if (tick <= 0n) throw new Error('bad_tick');
-
-  return (priceX6 / tick).toString();
+  const x6 = priceStrToX6(priceStr);
+  const { rows } = await query(
+    `select public.price_to_bucket($1::int4, $2::int8) as bucket`,
+    [Number(asset_id), x6]
+  );
+  if (!rows.length || rows[0].bucket === null) throw new Error('bad_asset_or_tick');
+  return String(rows[0].bucket);
 }
 
 /** GET /orders/by-price?asset=0&price=108910.01
- *  Retourne les IDs de positions en ordre LIMIT pour (asset, bucket(price)).
+ *  Renvoie toutes les IDs sur ce bucket (ORDER/SL/TP/LIQ) et on filtre côté Node si besoin.
+ *  (Toi tu visualisais les LIMIT uniquement ici => on renvoie uniquement ORDER pour compat)
  */
 app.get('/orders/by-price', async (req, res) => {
   try {
@@ -112,24 +82,27 @@ app.get('/orders/by-price', async (req, res) => {
     if (!price) return res.status(400).json({ error: 'price required' });
 
     const bucket_id = await computeBucketId(asset, price);
+    const x6 = priceStrToX6(price);
 
-    const { data, error } = await supabase
-      .from('order_buckets')
-      .select('position_id')
-      .eq('asset_id', asset)
-      .eq('bucket_id', bucket_id);
-    if (error) throw error;
+    const { rows } = await query(
+      `select * from public.get_ids_by_tick($1::int4, $2::int8)`,
+      [asset, x6]
+    );
 
-    res.json({ asset, price, bucket_id, ids: (data || []).map((r) => r.position_id) });
+    const ids = (rows || [])
+      .filter(r => r.kind === 'ORDER')
+      .map(r => Number(r.id));
+
+    res.json({ asset, price, bucket_id, ids });
   } catch (e) {
     logErr('API', e);
-    if (e.message === 'asset_not_found') return res.status(404).json({ error: 'asset_not_found' });
+    if (e.message === 'bad_asset_or_tick') return res.status(404).json({ error: 'asset_not_found_or_bad_tick' });
     res.status(500).json({ error: 'internal_error' });
   }
 });
 
 /** GET /stops/by-price?asset=0&price=108910.01
- *  Retourne les IDs et types (SL/TP/LIQ) des positions indexées à ce bucket.
+ *  Renvoie IDs + types (SL/TP/LIQ) pour ce bucket.
  */
 app.get('/stops/by-price', async (req, res) => {
   try {
@@ -139,24 +112,22 @@ app.get('/stops/by-price', async (req, res) => {
     if (!price) return res.status(400).json({ error: 'price required' });
 
     const bucket_id = await computeBucketId(asset, price);
+    const x6 = priceStrToX6(price);
 
-    const { data, error } = await supabase
-      .from('stop_buckets')
-      .select('position_id, stop_type')
-      .eq('asset_id', asset)
-      .eq('bucket_id', bucket_id);
-    if (error) throw error;
+    const { rows } = await query(
+      `select * from public.get_ids_by_tick($1::int4, $2::int8)`,
+      [asset, x6]
+    );
 
-    // map type -> label
-    const typeLabel = (t) => (t === 1 ? 'SL' : t === 2 ? 'TP' : t === 3 ? 'LIQ' : 'UNK');
+    const typeMap = { SL: 'SL', TP: 'TP', LIQ: 'LIQ' };
+    const items = (rows || [])
+      .filter(r => r.kind === 'SL' || r.kind === 'TP' || r.kind === 'LIQ')
+      .map(r => ({ id: Number(r.id), type: typeMap[r.kind] || 'UNK' }));
 
-    res.json({
-      asset, price, bucket_id,
-      items: (data || []).map((r) => ({ id: r.position_id, type: typeLabel(r.stop_type) }))
-    });
+    res.json({ asset, price, bucket_id, items });
   } catch (e) {
     logErr('API', e);
-    if (e.message === 'asset_not_found') return res.status(404).json({ error: 'asset_not_found' });
+    if (e.message === 'bad_asset_or_tick') return res.status(404).json({ error: 'asset_not_found_or_bad_tick' });
     res.status(500).json({ error: 'internal_error' });
   }
 });
@@ -164,3 +135,4 @@ app.get('/stops/by-price', async (req, res) => {
 app.listen(PORT, () => {
   logInfo('API', `listening on http://0.0.0.0:${PORT}`);
 });
+
