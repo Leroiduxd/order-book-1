@@ -13,12 +13,11 @@ async function main() {
 
   contract.on('StopsUpdated', async (id, slX6, tpX6, evt) => {
     try {
-      await handleStopsUpdatedEvent({ id, slX6, tpX6 });
-      logInfo(
-        TAG,
-        `stored id=${id} slX6=${slX6} tpX6=${tpX6}`,
-        `@ block=${evt.blockNumber} tx=${evt.transactionHash} logIndex=${evt.logIndex}`
+      await handleStopsUpdatedEvent(
+        { id, slX6, tpX6 },
+        { txHash: evt.transactionHash, blockNum: evt.blockNumber }
       );
+      logInfo(TAG, `stored id=${id} slX6=${slX6} tpX6=${tpX6} @ block=${evt.blockNumber} tx=${evt.transactionHash} logIndex=${evt.logIndex}`);
     } catch (e) {
       logErr(TAG, 'handleStopsUpdatedEvent failed:', e.message || e);
     }
@@ -29,3 +28,4 @@ main().catch((e) => {
   logErr(TAG, e);
   process.exit(1);
 });
+
