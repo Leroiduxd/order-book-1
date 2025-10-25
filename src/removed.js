@@ -13,12 +13,11 @@ async function main() {
 
   contract.on('Removed', async (id, reason, execX6, pnlUsd6, evt) => {
     try {
-      await handleRemovedEvent({ id, reason, execX6, pnlUsd6 });
-      logInfo(
-        TAG,
-        `stored id=${id} reason=${reason} execX6=${execX6} pnlUsd6=${pnlUsd6}`,
-        `@ block=${evt.blockNumber} tx=${evt.transactionHash} logIndex=${evt.logIndex}`
+      await handleRemovedEvent(
+        { id, reason, execX6, pnlUsd6 },
+        { txHash: evt.transactionHash, blockNum: evt.blockNumber }
       );
+      logInfo(TAG, `stored id=${id} reason=${reason} execX6=${execX6} pnlUsd6=${pnlUsd6} @ block=${evt.blockNumber} tx=${evt.transactionHash} logIndex=${evt.logIndex}`);
     } catch (e) {
       logErr(TAG, 'handleRemovedEvent failed:', e.message || e);
     }
@@ -29,3 +28,4 @@ main().catch((e) => {
   logErr(TAG, e);
   process.exit(1);
 });
+
