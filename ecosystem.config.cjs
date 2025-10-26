@@ -15,6 +15,15 @@ module.exports = {
       node_args: "--enable-source-maps"
     },
     {
+      name: "brokex-endpoint",
+      script: "src/endpoint.js",
+      cwd: ".",
+      env_file: ".env",
+      autorestart: true,
+      out_file: "logs/endpoint.out.log",
+      error_file: "logs/endpoint.err.log"
+    },
+    {
       name: "brokex-executed",
       script: "src/executed.js",
       cwd: ".",
