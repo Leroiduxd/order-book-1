@@ -1,0 +1,158 @@
+import 'dotenv/config';
+import express from 'express';
+import { get } from './shared/rest.js'; // <-- utilise le helper PostgREST qu’on a ajouté
+import { logInfo, logErr } from './shared/logger.js';
+
+const app = express();
+const PORT = 7392
+// --------- helpers ---------
+const isHexAddr = (s) => /^0x[a-fA-F0-9]{40}$/.test(String(s || ''));
+const toLower0x = (s) => String(s || '').toLowerCase();
+
+const STOP_LABEL_TO_INT = { SL: 1, TP: 2, LIQ: 3 };
+const STOP_INT_TO_LABEL = { 1: 'SL', 2: 'TP', 3: 'LIQ' };
+
+function parseIntParam(v, name) {
+  const n = Number(v);
+  if (!Number.isInteger(n)) throw new Error(`${name} must be an integer`);
+  return n;
+}
+
+// ========= 1) Assets list =========
+// GET /assets
+// -> retourne la liste des actifs listés (tout le contenu de la table assets)
+app.get('/assets', async (_req, res) => {
+  try {
+    // adapte les colonnes si tu en as d’autres (symbol, etc.)
+    const rows = await get('assets?select=asset_id,symbol,tick_size_usd6,lot_num,lot_den&order=asset_id.asc');
+    res.json(rows || []);
+  } catch (e) {
+    logErr('API+', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ========= 2) IDs d’un trader =========
+// GET /trader/:addr/ids
+// -> { trader, orders:[], open:[], cancelled:[], closed:[] }
+app.get('/trader/:addr/ids', async (req, res) => {
+  try {
+    const addr = String(req.params.addr || '').trim();
+    if (!isHexAddr(addr)) return res.status(400).json({ error: 'invalid address' });
+    const a = toLower0x(addr);
+
+    // states: 0=ORDER, 1=OPEN, 2=CLOSED/CANCELLED (distingués par close_reason)
+    const [orders, open, closedAll, cancelled] = await Promise.all([
+      get(`positions?trader_addr=eq.${a}&state=eq.0&select=id&order=id.asc`),
+      get(`positions?trader_addr=eq.${a}&state=eq.1&select=id&order=id.asc`),
+      get(`positions?trader_addr=eq.${a}&state=eq.2&select=id,close_reason&order=id.asc`),
+      get(`positions?trader_addr=eq.${a}&state=eq.2&close_reason=eq.0&select=id&order=id.asc`)
+    ]);
+
+    const closed = (closedAll || [])
+      .filter((r) => r.close_reason !== null && r.close_reason !== 0)
+      .map((r) => r.id);
+
+    res.json({
+      trader: a,
+      orders: (orders || []).map((r) => r.id),
+      open: (open || []).map((r) => r.id),
+      cancelled: (cancelled || []).map((r) => r.id),
+      closed
+    });
+  } catch (e) {
+    logErr('API+', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ========= 3) Infos d’un trader =========
+// GET /trader/:addr
+// -> { trader, counts: { orders, open, cancelled, closed }, positions?: [...] (optionnel) }
+app.get('/trader/:addr', async (req, res) => {
+  try {
+    const addr = String(req.params.addr || '').trim();
+    if (!isHexAddr(addr)) return res.status(400).json({ error: 'invalid address' });
+    const a = toLower0x(addr);
+
+    // on calcule des compteurs simples
+    const [orders, open, cancelled, closed] = await Promise.all([
+      get(`positions?trader_addr=eq.${a}&state=eq.0&select=id`),
+      get(`positions?trader_addr=eq.${a}&state=eq.1&select=id`),
+      get(`positions?trader_addr=eq.${a}&state=eq.2&close_reason=eq.0&select=id`),
+      get(`positions?trader_addr=eq.${a}&state=eq.2&close_reason=not.is.null&close_reason=neq.0&select=id`)
+    ]);
+
+    res.json({
+      trader: a,
+      counts: {
+        orders: orders?.length || 0,
+        open: open?.length || 0,
+        cancelled: cancelled?.length || 0,
+        closed: closed?.length || 0
+      }
+    });
+  } catch (e) {
+    logErr('API+', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ========= 4) Par bucket (orders / stops) =========
+// GET /by-bucket?asset=1&bucket=20500000&type=order
+// GET /by-bucket?asset=1&bucket=20500000&type=stops&stopType=SL|TP|LIQ&sort=type|id
+//
+// type=order  -> retourne { items: [{ id }] } depuis order_buckets
+// type=stops  -> retourne { items: [{ id, type: 'SL'|'TP'|'LIQ' }] } depuis stop_buckets
+// tri: sort=type (ordre SL,TP,LIQ), sort=id (par id asc), ou naturel par défaut
+app.get('/by-bucket', async (req, res) => {
+  try {
+    const asset  = parseIntParam(req.query.asset, 'asset');
+    const bucket = parseIntParam(req.query.bucket, 'bucket');
+    const type   = String(req.query.type || 'order').toLowerCase();  // 'order' | 'stops'
+    const sort   = String(req.query.sort || '').toLowerCase();       // 'type' | 'id' | ''
+    const stopTypeStr = req.query.stopType ? String(req.query.stopType).toUpperCase() : null;
+
+    if (!['order', 'stops'].includes(type)) {
+      return res.status(400).json({ error: 'type must be "order" or "stops"' });
+    }
+
+    if (type === 'order') {
+      const rows = await get(`order_buckets?asset_id=eq.${asset}&bucket_id=eq.${bucket}&select=position_id`);
+      let ids = (rows || []).map((r) => Number(r.position_id));
+      if (sort === 'id') ids = ids.sort((a, b) => a - b);
+      return res.json({ asset, bucket, kind: 'ORDER', items: ids.map((id) => ({ id })) });
+    }
+
+    // stops
+    let q = `stop_buckets?asset_id=eq.${asset}&bucket_id=eq.${bucket}&select=position_id,stop_type`;
+    if (stopTypeStr) {
+      const t = STOP_LABEL_TO_INT[stopTypeStr];
+      if (!t) return res.status(400).json({ error: 'stopType must be SL|TP|LIQ' });
+      q += `&stop_type=eq.${t}`;
+    }
+
+    let rows = await get(q);
+    let items = (rows || []).map((r) => ({
+      id: Number(r.position_id),
+      type: STOP_INT_TO_LABEL[Number(r.stop_type)] || 'UNK'
+    }));
+
+    if (sort === 'type') {
+      const rank = { SL: 1, TP: 2, LIQ: 3, UNK: 9 };
+      items.sort((a, b) => (rank[a.type] - rank[b.type]) || (a.id - b.id));
+    } else if (sort === 'id') {
+      items.sort((a, b) => a.id - b.id);
+    }
+
+    res.json({ asset, bucket, kind: 'STOPS', items });
+  } catch (e) {
+    logErr('API+', e);
+    if (/must be an integer/.test(String(e.message))) return res.status(400).json({ error: e.message });
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.listen(PORT, () => {
+  logInfo('API+', `listening on http://0.0.0.0:${PORT}`);
+});
