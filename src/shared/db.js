@@ -3,14 +3,17 @@ import { get, postArray, patch, del } from './rest.js';
 import { logInfo } from './logger.js';
 
 /* =========================================================
-   Helpers BigInt & maths
+   Helpers
 ========================================================= */
 const BI = (x) => BigInt(x);
 const divFloor = (a, b) => a / b;
 const mulDivFloor = (a, b, c) => (a * b) / c;
 
+// stringify sûr pour ids potentiellement grands (bigint)
+const idStr = (x) => (typeof x === 'bigint' ? x.toString() : String(x));
+
 /* =========================================================
-   Assets cache (tick/lot)  (schema: assets.asset_id, tick_size_usd6, lot_num, lot_den)
+   Assets cache (schema: assets.asset_id, tick_size_usd6, lot_num, lot_den)
 ========================================================= */
 const assetCache = new Map();
 export async function getAsset(asset_id) {
@@ -33,6 +36,7 @@ function computeNotionalAndMargin({ entry_x6, lots, leverage_x, lot_num, lot_den
   const lotNum  = BI(lot_num ?? 1);
   const lotDen  = BI(lot_den ?? 1);
   const lev     = BI(leverage_x);
+
   const qty_num = lotsBI * lotNum;
   const qty_den = lotDen;
 
@@ -42,7 +46,7 @@ function computeNotionalAndMargin({ entry_x6, lots, leverage_x, lot_num, lot_den
 }
 
 /* =========================================================
-   Indexation des stops (SL/TP/LIQ) via UPSERT PostgREST
+   Indexation des stops (SL/TP/LIQ) via PostgREST
    - side antagoniste (!long_side)
    - conserve lots
 ========================================================= */
@@ -54,13 +58,12 @@ async function indexStops({ asset_id, position_id, sl_x6, tp_x6, liq_x6, long_si
   if (Number(sl_x6)  !== 0) rows.push({ px: BI(sl_x6),  type: 1 }); // SL
   if (Number(tp_x6)  !== 0) rows.push({ px: BI(tp_x6),  type: 2 }); // TP
   if (Number(liq_x6) !== 0) rows.push({ px: BI(liq_x6), type: 3 }); // LIQ
-
   if (!rows.length) return;
 
   const payload = rows.map(r => ({
     asset_id: Number(asset_id),
     bucket_id: divFloor(r.px, tick).toString(),
-    position_id: Number(position_id),
+    position_id: idStr(position_id),
     stop_type: r.type,
     lots: Number(lots || 0),
     side: !Boolean(long_side) // antagoniste dans l'order book
@@ -74,9 +77,9 @@ async function indexStops({ asset_id, position_id, sl_x6, tp_x6, liq_x6, long_si
 
 /* =========================================================
    OPENED (state=0=ORDER, state=1=OPEN)
-   - positions: upsert (+ trader_addr_lc)
+   - positions: upsert (⚠️ ne PAS envoyer trader_addr_lc — colonne générée)
    - state=0: order_buckets upsert (target) avec lots + side=longSide
-   - state=1: stop_buckets upsert (SL/TP/LIQ) avec lots + side=!longSide
+   - state=1: stop_buckets upsert (SL/TP/LIQ) lots + side=!longSide
 ========================================================= */
 export async function upsertOpenedEvent(ev) {
   const {
@@ -102,14 +105,13 @@ export async function upsertOpenedEvent(ev) {
     margin_usd6   = calc.margin_usd6;
   }
 
-  // 1) UPSERT position
+  // 1) UPSERT position (pas de trader_addr_lc ici)
   await postArray('positions?on_conflict=id', [
     {
-      id: Number(id),
+      id: idStr(id),
       state: Number(state),
       asset_id: Number(asset),
       trader_addr: String(trader),
-      trader_addr_lc: String(trader).toLowerCase(),
       long_side: Boolean(longSide),
       lots: Number(lots),
       leverage_x: Number(leverageX),
@@ -123,7 +125,7 @@ export async function upsertOpenedEvent(ev) {
     }
   ]);
 
-  // 2) Index
+  // 2) Indexation
   if (Number(state) === 0) {
     // ORDER -> order_buckets (lots + side = longSide)
     const tick   = BI(assetRow.tick_size_usd6);
@@ -135,17 +137,17 @@ export async function upsertOpenedEvent(ev) {
       [{
         asset_id: Number(asset),
         bucket_id: bucket,
-        position_id: Number(id),
+        position_id: idStr(id),
         lots: Number(lots || 0),
         side: Boolean(longSide)
       }]
     );
   } else {
-    // OPEN -> (re)indexer SL/TP/LIQ (antagoniste)
-    await del(`stop_buckets?position_id=eq.${Number(id)}`);
+    // OPEN -> (re)indexer SL/TP/LIQ antagonistes
+    await del(`stop_buckets?position_id=eq.${idStr(id)}`);
     await indexStops({
       asset_id: Number(asset),
-      position_id: Number(id),
+      position_id: idStr(id),
       sl_x6: slX6,
       tp_x6: tpX6,
       liq_x6: liqX6,
@@ -154,22 +156,22 @@ export async function upsertOpenedEvent(ev) {
     });
   }
 
-  logInfo('DB', `Opened upserted id=${id} state=${state} (indexed=${Number(state)===0?'order':'stops'})`);
+  logInfo('DB', `Opened upserted id=${idStr(id)} state=${state} (indexed=${Number(state)===0?'order':'stops'})`);
 }
 
 /* =========================================================
    EXECUTED (ORDER -> OPEN)
    - update position: state=1, entry_x6, notional/margin
    - delete order_buckets
-   - (re)index SL/TP/LIQ (antagoniste)
+   - (re)index SL/TP/LIQ antagonistes
 ========================================================= */
 export async function handleExecutedEvent(ev) {
   const { id, entryX6 } = ev;
 
-  // Lire position pour lots, leverage, asset, stops actuels (inclure long_side)
-  const rows = await get(`positions?id=eq.${Number(id)}&select=asset_id,lots,leverage_x,sl_x6,tp_x6,liq_x6,long_side`);
+  // Lire position: besoin de asset_id, lots, leverage_x, stops actuels, long_side
+  const rows = await get(`positions?id=eq.${idStr(id)}&select=asset_id,lots,leverage_x,sl_x6,tp_x6,liq_x6,long_side`);
   const pos = rows?.[0];
-  if (!pos) throw new Error(`Position ${id} introuvable pour Executed`);
+  if (!pos) throw new Error(`Position ${idStr(id)} introuvable pour Executed`);
 
   const assetRow = await getAsset(Number(pos.asset_id));
   const calc = computeNotionalAndMargin({
@@ -180,9 +182,9 @@ export async function handleExecutedEvent(ev) {
     lot_den: assetRow.lot_den
   });
 
-  // 1) Update position (PATCH avec filtre)
+  // 1) Update position
   await patch(
-    `positions?id=eq.${Number(id)}`,
+    `positions?id=eq.${idStr(id)}`,
     {
       state: 1,
       entry_x6: BI(entryX6).toString(),
@@ -191,14 +193,14 @@ export async function handleExecutedEvent(ev) {
     }
   );
 
-  // 2) Retirer des order_buckets
-  await del(`order_buckets?position_id=eq.${Number(id)}`);
+  // 2) Nettoyage des index
+  await del(`order_buckets?position_id=eq.${idStr(id)}`);
+  await del(`stop_buckets?position_id=eq.${idStr(id)}`);
 
   // 3) (Ré)indexer SL/TP/LIQ antagonistes
-  await del(`stop_buckets?position_id=eq.${Number(id)}`);
   await indexStops({
     asset_id: Number(pos.asset_id),
-    position_id: Number(id),
+    position_id: idStr(id),
     sl_x6: pos.sl_x6 ?? 0,
     tp_x6: pos.tp_x6 ?? 0,
     liq_x6: pos.liq_x6 ?? 0,
@@ -206,36 +208,35 @@ export async function handleExecutedEvent(ev) {
     lots: Number(pos.lots || 0)
   });
 
-  logInfo('DB', `Executed applied id=${id} entryX6=${entryX6} (order->stops indexed)`);
+  logInfo('DB', `Executed applied id=${idStr(id)} entryX6=${entryX6} (order->stops indexed)`);
 }
 
 /* =========================================================
    STOPS UPDATED
    - update SL/TP (pas LIQ)
    - delete stop_buckets (types 1,2), conserve LIQ (3)
-   - re-index SL/TP (antagoniste)
+   - re-index SL/TP antagonistes
 ========================================================= */
 export async function handleStopsUpdatedEvent(ev) {
   const { id, slX6, tpX6 } = ev;
 
-  // Inclure long_side & lots
-  const rows = await get(`positions?id=eq.${Number(id)}&select=asset_id,liq_x6,long_side,lots`);
+  const rows = await get(`positions?id=eq.${idStr(id)}&select=asset_id,liq_x6,long_side,lots`);
   const pos = rows?.[0];
-  if (!pos) throw new Error(`Position ${id} introuvable pour StopsUpdated`);
+  if (!pos) throw new Error(`Position ${idStr(id)} introuvable pour StopsUpdated`);
 
   // 1) Update SL/TP
   await patch(
-    `positions?id=eq.${Number(id)}`,
+    `positions?id=eq.${idStr(id)}`,
     { sl_x6: BI(slX6 ?? 0).toString(), tp_x6: BI(tpX6 ?? 0).toString() }
   );
 
   // 2) Supprimer SL/TP (1,2), conserver LIQ (3)
-  await del(`stop_buckets?position_id=eq.${Number(id)}&stop_type=in.(1,2)`);
+  await del(`stop_buckets?position_id=eq.${idStr(id)}&stop_type=in.(1,2)`);
 
   // 3) Réindexer SL/TP antagonistes
   await indexStops({
     asset_id: Number(pos.asset_id),
-    position_id: Number(id),
+    position_id: idStr(id),
     sl_x6: slX6,
     tp_x6: tpX6,
     liq_x6: 0,
@@ -243,7 +244,7 @@ export async function handleStopsUpdatedEvent(ev) {
     lots: Number(pos.lots || 0)
   });
 
-  logInfo('DB', `StopsUpdated id=${id} slX6=${slX6} tpX6=${tpX6} (LIQ conservé)`);
+  logInfo('DB', `StopsUpdated id=${idStr(id)} slX6=${slX6} tpX6=${tpX6} (LIQ conservé)`);
 }
 
 /* =========================================================
@@ -255,7 +256,7 @@ export async function handleRemovedEvent(ev) {
   const { id, reason, execX6, pnlUsd6 } = ev;
 
   await patch(
-    `positions?id=eq.${Number(id)}`,
+    `positions?id=eq.${idStr(id)}`,
     {
       state: 2,
       close_reason: Number(reason),
@@ -264,7 +265,7 @@ export async function handleRemovedEvent(ev) {
     }
   );
 
-  await del(`stop_buckets?position_id=eq.${Number(id)}`);
+  await del(`stop_buckets?position_id=eq.${idStr(id)}`);
 
-  logInfo('DB', `Removed id=${id} reason=${reason} execX6=${execX6} pnlUsd6=${pnlUsd6}`);
+  logInfo('DB', `Removed id=${idStr(id)} reason=${reason} execX6=${execX6} pnlUsd6=${pnlUsd6}`);
 }
