@@ -28,4 +28,7 @@ async function main() {
   );
 }
 
+process.on('unhandledRejection', (err) => logErr(TAG, 'unhandledRejection', err));
+process.on('uncaughtException', (err) => logErr(TAG, 'uncaughtException', err));
+
 main().catch((e) => { logErr(TAG, e); process.exit(1); });
