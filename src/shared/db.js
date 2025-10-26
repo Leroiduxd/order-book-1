@@ -1,5 +1,6 @@
+// src/shared/db.js
 import { get, postArray, patch, del } from './rest.js';
-import { logInfo, logErr } from './logger.js';
+import { logInfo } from './logger.js';
 
 /* =========================================================
    Helpers BigInt & maths
@@ -42,8 +43,10 @@ function computeNotionalAndMargin({ entry_x6, lots, leverage_x, lot_num, lot_den
 
 /* =========================================================
    Indexation des stops (SL/TP/LIQ) via UPSERT PostgREST
+   - side antagoniste (!long_side)
+   - conserve lots
 ========================================================= */
-async function indexStops({ asset_id, position_id, sl_x6, tp_x6, liq_x6 }) {
+async function indexStops({ asset_id, position_id, sl_x6, tp_x6, liq_x6, long_side, lots }) {
   const asset = await getAsset(Number(asset_id));
   const tick  = BI(asset.tick_size_usd6);
 
@@ -58,7 +61,9 @@ async function indexStops({ asset_id, position_id, sl_x6, tp_x6, liq_x6 }) {
     asset_id: Number(asset_id),
     bucket_id: divFloor(r.px, tick).toString(),
     position_id: Number(position_id),
-    stop_type: r.type
+    stop_type: r.type,
+    lots: Number(lots || 0),
+    side: !Boolean(long_side) // antagoniste dans l'order book
   }));
 
   await postArray(
@@ -69,9 +74,9 @@ async function indexStops({ asset_id, position_id, sl_x6, tp_x6, liq_x6 }) {
 
 /* =========================================================
    OPENED (state=0=ORDER, state=1=OPEN)
-   - positions: upsert
-   - state=0: order_buckets upsert (target)
-   - state=1: stop_buckets upsert (SL/TP/LIQ)
+   - positions: upsert (+ trader_addr_lc)
+   - state=0: order_buckets upsert (target) avec lots + side=longSide
+   - state=1: stop_buckets upsert (SL/TP/LIQ) avec lots + side=!longSide
 ========================================================= */
 export async function upsertOpenedEvent(ev) {
   const {
@@ -104,6 +109,7 @@ export async function upsertOpenedEvent(ev) {
       state: Number(state),
       asset_id: Number(asset),
       trader_addr: String(trader),
+      trader_addr_lc: String(trader).toLowerCase(),
       long_side: Boolean(longSide),
       lots: Number(lots),
       leverage_x: Number(leverageX),
@@ -119,24 +125,32 @@ export async function upsertOpenedEvent(ev) {
 
   // 2) Index
   if (Number(state) === 0) {
-    // ORDER -> index target dans order_buckets (UPSERT)
+    // ORDER -> order_buckets (lots + side = longSide)
     const tick   = BI(assetRow.tick_size_usd6);
     const price  = BI(entryOrTargetX6);
     const bucket = divFloor(price, tick).toString();
 
     await postArray(
       'order_buckets?on_conflict=asset_id,bucket_id,position_id',
-      [{ asset_id: Number(asset), bucket_id: bucket, position_id: Number(id) }]
+      [{
+        asset_id: Number(asset),
+        bucket_id: bucket,
+        position_id: Number(id),
+        lots: Number(lots || 0),
+        side: Boolean(longSide)
+      }]
     );
   } else {
-    // OPEN -> (re)indexer SL/TP/LIQ
+    // OPEN -> (re)indexer SL/TP/LIQ (antagoniste)
     await del(`stop_buckets?position_id=eq.${Number(id)}`);
     await indexStops({
       asset_id: Number(asset),
       position_id: Number(id),
       sl_x6: slX6,
       tp_x6: tpX6,
-      liq_x6: liqX6
+      liq_x6: liqX6,
+      long_side: Boolean(longSide),
+      lots: Number(lots || 0)
     });
   }
 
@@ -147,13 +161,13 @@ export async function upsertOpenedEvent(ev) {
    EXECUTED (ORDER -> OPEN)
    - update position: state=1, entry_x6, notional/margin
    - delete order_buckets
-   - (re)index SL/TP/LIQ
+   - (re)index SL/TP/LIQ (antagoniste)
 ========================================================= */
 export async function handleExecutedEvent(ev) {
   const { id, entryX6 } = ev;
 
-  // Lire position pour lots, leverage, asset, stops actuels
-  const rows = await get(`positions?id=eq.${Number(id)}&select=asset_id,lots,leverage_x,sl_x6,tp_x6,liq_x6`);
+  // Lire position pour lots, leverage, asset, stops actuels (inclure long_side)
+  const rows = await get(`positions?id=eq.${Number(id)}&select=asset_id,lots,leverage_x,sl_x6,tp_x6,liq_x6,long_side`);
   const pos = rows?.[0];
   if (!pos) throw new Error(`Position ${id} introuvable pour Executed`);
 
@@ -180,14 +194,16 @@ export async function handleExecutedEvent(ev) {
   // 2) Retirer des order_buckets
   await del(`order_buckets?position_id=eq.${Number(id)}`);
 
-  // 3) (Ré)indexer SL/TP/LIQ
+  // 3) (Ré)indexer SL/TP/LIQ antagonistes
   await del(`stop_buckets?position_id=eq.${Number(id)}`);
   await indexStops({
     asset_id: Number(pos.asset_id),
     position_id: Number(id),
     sl_x6: pos.sl_x6 ?? 0,
     tp_x6: pos.tp_x6 ?? 0,
-    liq_x6: pos.liq_x6 ?? 0
+    liq_x6: pos.liq_x6 ?? 0,
+    long_side: Boolean(pos.long_side),
+    lots: Number(pos.lots || 0)
   });
 
   logInfo('DB', `Executed applied id=${id} entryX6=${entryX6} (order->stops indexed)`);
@@ -197,13 +213,13 @@ export async function handleExecutedEvent(ev) {
    STOPS UPDATED
    - update SL/TP (pas LIQ)
    - delete stop_buckets (types 1,2), conserve LIQ (3)
-   - re-index SL/TP (upsert)
+   - re-index SL/TP (antagoniste)
 ========================================================= */
 export async function handleStopsUpdatedEvent(ev) {
   const { id, slX6, tpX6 } = ev;
 
-  // Lire position pour asset_id
-  const rows = await get(`positions?id=eq.${Number(id)}&select=asset_id,liq_x6`);
+  // Inclure long_side & lots
+  const rows = await get(`positions?id=eq.${Number(id)}&select=asset_id,liq_x6,long_side,lots`);
   const pos = rows?.[0];
   if (!pos) throw new Error(`Position ${id} introuvable pour StopsUpdated`);
 
@@ -213,16 +229,18 @@ export async function handleStopsUpdatedEvent(ev) {
     { sl_x6: BI(slX6 ?? 0).toString(), tp_x6: BI(tpX6 ?? 0).toString() }
   );
 
-  // 2) Supprimer SL/TP, conserver LIQ
+  // 2) Supprimer SL/TP (1,2), conserver LIQ (3)
   await del(`stop_buckets?position_id=eq.${Number(id)}&stop_type=in.(1,2)`);
 
-  // 3) Réindexer SL/TP
+  // 3) Réindexer SL/TP antagonistes
   await indexStops({
     asset_id: Number(pos.asset_id),
     position_id: Number(id),
     sl_x6: slX6,
     tp_x6: tpX6,
-    liq_x6: 0
+    liq_x6: 0,
+    long_side: Boolean(pos.long_side),
+    lots: Number(pos.lots || 0)
   });
 
   logInfo('DB', `StopsUpdated id=${id} slX6=${slX6} tpX6=${tpX6} (LIQ conservé)`);
@@ -250,4 +268,3 @@ export async function handleRemovedEvent(ev) {
 
   logInfo('DB', `Removed id=${id} reason=${reason} execX6=${execX6} pnlUsd6=${pnlUsd6}`);
 }
-
