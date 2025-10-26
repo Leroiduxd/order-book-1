@@ -1,10 +1,8 @@
-// ===============================================
-// BROKEX — Public API (endpoint.js)
-// ===============================================
-
+// src/endpoint.js
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+
 import { get } from './shared/rest.js';
 import { logInfo, logErr } from './shared/logger.js';
 
@@ -12,127 +10,282 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const ENDPOINT = process.env.ENDPOINT || 'http://127.0.0.1:9304';
-const PORT = Number(process.env.PORT_EXTRA || 7392);
+const PORT = Number(process.env.API_PORT || process.env.PORT || 7392);
 
-console.log('[REST] Using PostgREST ENDPOINT =', ENDPOINT);
-console.log('[API+] PORT =', PORT);
+/* -------------------------------
+   Helpers
+-------------------------------- */
+const isHexAddr = (s) => /^0x[a-fA-F0-9]{40}$/.test(String(s || ''));
+const toLowerAddr = (s) => String(s || '').toLowerCase();
 
-// =========================================================
-// Endpoint: GET /assets
-// =========================================================
-app.get('/assets', async (req, res) => {
+/** Parse string price (e.g. "108910.01") to x6 BigInt safely (no FP). */
+function priceStrToX6(str) {
+  if (typeof str !== 'string') str = String(str);
+  const sign = str.trim().startsWith('-') ? '-' : '';
+  const [intRaw, fracRaw = ''] = str.replace(/,/g, '').split('.');
+  const intPart = (intRaw || '0').replace(/^(-?)0+/, '$1') || '0';
+  const fracPart = (fracRaw + '000000').slice(0, 6);
+  const digits = (intPart.replace('-', '') || '0') + fracPart;
+  return BigInt(sign + digits);
+}
+
+/** Compute bucket id from (asset, price x6) using assets.tick_size_usd6 */
+async function computeBucketId(assetId, priceX6) {
+  const rows = await get(`assets?asset_id=eq.${Number(assetId)}&select=tick_size_usd6&limit=1`);
+  const asset = rows?.[0];
+  if (!asset) throw Object.assign(new Error('asset_not_found'), { http: 404 });
+  const tick = BigInt(asset.tick_size_usd6);
+  if (tick <= 0n) throw Object.assign(new Error('bad_tick'), { http: 400 });
+  return (BigInt(priceX6) / tick).toString();
+}
+
+function ok(res, data) { res.json(data); }
+function bad(res, msg = 'bad_request', code = 400) { res.status(code).json({ error: msg }); }
+
+/* -------------------------------
+   Health
+-------------------------------- */
+app.get('/health', async (_req, res) => {
   try {
-    const rows = await get('assets?select=*');
-    res.json(rows);
-  } catch (err) {
-    logErr('API /assets', err);
+    // ping minimal PostgREST
+    await get('assets?select=asset_id&limit=1');
+    ok(res, { ok: true });
+  } catch (e) {
+    logErr('API+', e);
+    res.status(500).json({ ok: false, error: 'postgrest_unreachable' });
+  }
+});
+
+/* -------------------------------
+   Assets
+-------------------------------- */
+app.get('/assets', async (_req, res) => {
+  try {
+    const rows = await get('assets?select=asset_id,symbol,tick_size_usd6,lot_num,lot_den&order=asset_id.asc');
+    ok(res, rows || []);
+  } catch (e) {
+    logErr('API+/assets', e);
     res.status(500).json({ error: 'internal_error' });
   }
 });
 
-// =========================================================
-// Endpoint: GET /trader/:addr/ids
-// Renvoie les IDs groupés par state pour un trader
-// =========================================================
-app.get('/trader/:addr/ids', async (req, res) => {
+app.get('/assets/:assetId', async (req, res) => {
   try {
-    const addr = String(req.params.addr).toLowerCase();
-    if (!addr.match(/^0x[a-f0-9]{40}$/)) {
-      return res.status(400).json({ error: 'invalid address (lowercase expected)' });
-    }
-
-    const rows = await get(`positions?trader_addr_lc=eq.${addr}&select=id,state,close_reason&order=id.asc`);
-    const grouped = { orders: [], open: [], closed: [], cancelled: [] };
-
-    for (const r of rows) {
-      if (r.state === 0) grouped.orders.push(r.id);
-      else if (r.state === 1) grouped.open.push(r.id);
-      else if (r.state === 2 && r.close_reason === 0) grouped.cancelled.push(r.id);
-      else if (r.state === 2) grouped.closed.push(r.id);
-    }
-
-    res.json({ trader: addr, ...grouped });
-  } catch (err) {
-    logErr('API /trader/:addr/ids', err);
+    const assetId = Number(req.params.assetId);
+    if (!Number.isInteger(assetId)) return bad(res, 'asset_id_invalid');
+    const rows = await get(`assets?asset_id=eq.${assetId}&select=asset_id,symbol,tick_size_usd6,lot_num,lot_den&limit=1`);
+    if (!rows?.length) return res.status(404).json({ error: 'asset_not_found' });
+    ok(res, rows[0]);
+  } catch (e) {
+    logErr('API+/assets/:id', e);
     res.status(500).json({ error: 'internal_error' });
   }
 });
 
-// =========================================================
-// Endpoint: GET /trader/:addr
-// Renvoie les positions complètes d’un trader
-// =========================================================
-app.get('/trader/:addr', async (req, res) => {
-  try {
-    const addr = String(req.params.addr).toLowerCase();
-    if (!addr.match(/^0x[a-f0-9]{40}$/)) {
-      return res.status(400).json({ error: 'invalid address (lowercase expected)' });
-    }
-
-    const rows = await get(
-      `positions?trader_addr_lc=eq.${addr}&select=id,state,asset_id,long_side,lots,leverage_x,entry_x6,target_x6,sl_x6,tp_x6,liq_x6,close_reason,exec_x6,pnl_usd6,notional_usd6,margin_usd6,created_at,updated_at&order=id.asc`
-    );
-    res.json(rows);
-  } catch (err) {
-    logErr('API /trader/:addr', err);
-    res.status(500).json({ error: 'internal_error' });
-  }
-});
-
-// =========================================================
-// Endpoint: GET /position/:id
-// Renvoie toutes les infos d’une position précise
-// =========================================================
+/* -------------------------------
+   Position detail
+-------------------------------- */
 app.get('/position/:id', async (req, res) => {
   try {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
-
-    const rows = await get(`positions?id=eq.${id}&select=*`);
-    if (!rows.length) return res.status(404).json({ error: 'not_found' });
-
-    res.json(rows[0]);
-  } catch (err) {
-    logErr('API /position/:id', err);
+    const id = String(req.params.id);
+    const rows = await get(`positions?id=eq.${id}&select=*&limit=1`);
+    if (!rows?.length) return res.status(404).json({ error: 'position_not_found' });
+    ok(res, rows[0]);
+  } catch (e) {
+    logErr('API+/position/:id', e);
     res.status(500).json({ error: 'internal_error' });
   }
 });
 
-// =========================================================
-// Endpoint: GET /by-bucket?asset=0&bucket=10917030&type=order|stops
-// Retourne les positions correspondant à ce bucket
-// =========================================================
-app.get('/by-bucket', async (req, res) => {
+/* -------------------------------
+   Trader grouped IDs
+-------------------------------- */
+app.get('/trader/:addr', async (req, res) => {
+  try {
+    const addrRaw = String(req.params.addr || '');
+    if (!isHexAddr(addrRaw)) return bad(res, 'invalid_address');
+    const addr = toLowerAddr(addrRaw);
+
+    const [orders, open, closedAll] = await Promise.all([
+      get(`positions?trader_addr_lc=eq.${addr}&state=eq.0&select=id&order=id.asc`),
+      get(`positions?trader_addr_lc=eq.${addr}&state=eq.1&select=id&order=id.asc`),
+      get(`positions?trader_addr_lc=eq.${addr}&state=eq.2&select=id,close_reason&order=id.asc`)
+    ]);
+
+    const cancelled = (closedAll || []).filter(r => r.close_reason === 0).map(r => r.id);
+    const closed    = (closedAll || []).filter(r => r.close_reason !== null && r.close_reason !== 0).map(r => r.id);
+
+    ok(res, {
+      trader: addr,
+      orders: (orders || []).map(r => r.id),
+      open:   (open   || []).map(r => r.id),
+      cancelled,
+      closed
+    });
+  } catch (e) {
+    logErr('API+/trader/:addr', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+/* -------------------------------
+   Buckets: orders & stops
+   /bucket/orders?asset=0&price=108910.01   (ou &bucket=12345)
+   /bucket/stops?asset=0&price=108910.01    (ou &bucket=12345)
+   Options:
+     - side=long|short|all (def all)
+     - sort=lots|id  (def lots)
+     - order=desc|asc (def desc)
+-------------------------------- */
+function parseSideFilter(q) {
+  const s = String(q.side || 'all').toLowerCase();
+  if (s === 'long') return true;
+  if (s === 'short') return false;
+  return null; // all
+}
+function parseSort(q) {
+  const s = String(q.sort || 'lots').toLowerCase();
+  return s === 'id' ? 'id' : 'lots';
+}
+function parseOrder(q) {
+  const s = String(q.order || 'desc').toLowerCase();
+  return s === 'asc' ? 'asc' : 'desc';
+}
+
+app.get('/bucket/orders', async (req, res) => {
   try {
     const asset = Number(req.query.asset);
-    const bucket = String(req.query.bucket || '').trim();
-    const type = String(req.query.type || 'order');
+    if (!Number.isInteger(asset)) return bad(res, 'asset_required');
 
-    if (!Number.isInteger(asset)) return res.status(400).json({ error: 'asset (int) required' });
-    if (!bucket) return res.status(400).json({ error: 'bucket required' });
+    let bucket = String(req.query.bucket || '').trim();
+    const price = String(req.query.price || '').trim();
+    if (!bucket && !price) return bad(res, 'price_or_bucket_required');
 
-    let table = type === 'stops' ? 'stop_buckets' : 'order_buckets';
-    const rows = await get(`${table}?asset_id=eq.${asset}&bucket_id=eq.${bucket}&select=*`);
-    res.json(rows);
-  } catch (err) {
-    logErr('API /by-bucket', err);
+    if (!bucket) {
+      const priceX6 = priceStrToX6(price);
+      bucket = await computeBucketId(asset, priceX6);
+    }
+
+    const side = parseSideFilter(req.query);
+    const sort = parseSort(req.query);
+    const ord  = parseOrder(req.query);
+
+    // base query
+    let qp = `order_buckets?asset_id=eq.${asset}&bucket_id=eq.${bucket}&select=position_id,lots,side&order=${sort}.${ord}`;
+    if (side !== null) qp += `&side=eq.${side}`;
+
+    const rows = await get(qp);
+    ok(res, {
+      asset,
+      bucket_id: bucket,
+      count: rows?.length || 0,
+      items: (rows || []).map(r => ({
+        id: r.position_id, lots: r.lots ?? 0, side: r.side === true ? 'LONG' : 'SHORT'
+      }))
+    });
+  } catch (e) {
+    if (e?.message === 'asset_not_found') return res.status(404).json({ error: 'asset_not_found' });
+    if (e?.message === 'bad_tick')       return res.status(400).json({ error: 'bad_tick' });
+    logErr('API+/bucket/orders', e);
     res.status(500).json({ error: 'internal_error' });
   }
 });
 
-// =========================================================
-// Anti double-listen guard + startup
-// =========================================================
-if (!global.__BROKEX_ENDPOINT_STARTED__) {
-  global.__BROKEX_ENDPOINT_STARTED__ = true;
+app.get('/bucket/stops', async (req, res) => {
+  try {
+    const asset = Number(req.query.asset);
+    if (!Number.isInteger(asset)) return bad(res, 'asset_required');
 
-  process.on('unhandledRejection', (err) => console.error('[API+] UnhandledRejection:', err));
-  process.on('uncaughtException', (err) => console.error('[API+] UncaughtException:', err));
+    let bucket = String(req.query.bucket || '').trim();
+    const price = String(req.query.price || '').trim();
+    if (!bucket && !price) return bad(res, 'price_or_bucket_required');
 
-  app.listen(PORT, '0.0.0.0', () => {
-    logInfo('BROKEX[API+]', `listening on http://0.0.0.0:${PORT}`);
-  });
-} else {
-  console.log('[API+] listen() skipped (already started)');
-}
+    if (!bucket) {
+      const priceX6 = priceStrToX6(price);
+      bucket = await computeBucketId(asset, priceX6);
+    }
+
+    const side = parseSideFilter(req.query);
+    const sort = parseSort(req.query);
+    const ord  = parseOrder(req.query);
+
+    let qp = `stop_buckets?asset_id=eq.${asset}&bucket_id=eq.${bucket}&select=position_id,stop_type,lots,side&order=${sort}.${ord}`;
+    if (side !== null) qp += `&side=eq.${side}`;
+
+    const rows = await get(qp);
+    const label = (t) => (t === 1 ? 'SL' : t === 2 ? 'TP' : t === 3 ? 'LIQ' : 'UNK');
+
+    ok(res, {
+      asset,
+      bucket_id: bucket,
+      count: rows?.length || 0,
+      items: (rows || []).map(r => ({
+        id: r.position_id,
+        type: label(r.stop_type),
+        lots: r.lots ?? 0,
+        side: r.side === true ? 'LONG' : 'SHORT'
+      }))
+    });
+  } catch (e) {
+    if (e?.message === 'asset_not_found') return res.status(404).json({ error: 'asset_not_found' });
+    if (e?.message === 'bad_tick')       return res.status(400).json({ error: 'bad_tick' });
+    logErr('API+/bucket/stops', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+/* -------------------------------
+   Exposure
+-------------------------------- */
+app.get('/exposure', async (_req, res) => {
+  try {
+    const rows = await get('exposure_metrics?select=asset_id,side_label,sum_lots,avg_entry_x6,avg_leverage_x,avg_liq_x6,positions_count&order=asset_id.asc,side_label.asc');
+    ok(res, rows || []);
+  } catch (e) {
+    logErr('API+/exposure', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.get('/exposure/:assetId', async (req, res) => {
+  try {
+    const assetId = Number(req.params.assetId);
+    if (!Number.isInteger(assetId)) return bad(res, 'asset_id_invalid');
+
+    const rows = await get(`exposure_metrics?asset_id=eq.${assetId}&select=asset_id,side_label,sum_lots,avg_entry_x6,avg_leverage_x,avg_liq_x6,positions_count`);
+    // format “joli” groupé long/short
+    const out = { asset_id: assetId, long: null, short: null };
+    for (const r of (rows || [])) {
+      const obj = {
+        sum_lots: Number(r.sum_lots || 0),
+        avg_entry_x6: r.avg_entry_x6 === null ? null : Number(r.avg_entry_x6),
+        avg_leverage_x: r.avg_leverage_x === null ? null : Number(r.avg_leverage_x),
+        avg_liq_x6: r.avg_liq_x6 === null ? null : Number(r.avg_liq_x6),
+        positions_count: Number(r.positions_count || 0)
+      };
+      if (String(r.side_label).toUpperCase() === 'LONG') out.long = obj;
+      if (String(r.side_label).toUpperCase() === 'SHORT') out.short = obj;
+    }
+    ok(res, out);
+  } catch (e) {
+    logErr('API+/exposure/:asset', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+/* -------------------------------
+   404 fallback
+-------------------------------- */
+app.use((_req, res) => res.status(404).json({ error: 'not_found' }));
+
+/* -------------------------------
+   Start
+-------------------------------- */
+app.listen(PORT, '0.0.0.0', () => {
+  logInfo('BROKEX', `[API+] listening on http://0.0.0.0:${PORT}`);
+});
+
+// guards
+process.on('unhandledRejection', (err) => logErr('API+','unhandledRejection', err));
+process.on('uncaughtException', (err) => logErr('API+','uncaughtException', err));
+
