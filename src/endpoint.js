@@ -5,8 +5,6 @@ import { get } from './shared/rest.js';
 import { logInfo, logErr } from './shared/logger.js';
 
 const app = express();
-
-/** Configure ton port public ici (exposé sur le VPS) */
 const PORT = Number(process.env.PORT_EXTRA || 7392);
 
 // ---------- Helpers ----------
@@ -22,7 +20,6 @@ function intParam(v, name) {
 
 // ---------- 1) Assets list ----------
 // GET /assets
-// Retourne la liste des actifs (adapter les colonnes si besoin)
 app.get('/assets', async (_req, res) => {
   try {
     const rows = await get('assets?select=asset_id,symbol,tick_size_usd6,lot_num,lot_den&order=asset_id.asc');
@@ -35,7 +32,6 @@ app.get('/assets', async (_req, res) => {
 
 // ---------- 2) IDs d’un trader ----------
 // GET /trader/:addr/ids
-// -> { trader, orders:[], open:[], cancelled:[], closed:[] }
 app.get('/trader/:addr/ids', async (req, res) => {
   try {
     const addr = String(req.params.addr || '').trim();
@@ -68,7 +64,6 @@ app.get('/trader/:addr/ids', async (req, res) => {
 
 // ---------- 3) Infos d’un trader (compteurs) ----------
 // GET /trader/:addr
-// -> { trader, counts: { orders, open, cancelled, closed } }
 app.get('/trader/:addr', async (req, res) => {
   try {
     const addr = String(req.params.addr || '').trim();
@@ -99,41 +94,51 @@ app.get('/trader/:addr', async (req, res) => {
 
 // ---------- 4) Par bucket (orders / stops) ----------
 // GET /by-bucket?asset=1&bucket=20500000&type=order
-// GET /by-bucket?asset=1&bucket=20500000&type=stops&stopType=SL|TP|LIQ&sort=type|id
-//
-// type=order  -> items: [{ id }]
-// type=stops  -> items: [{ id, type: 'SL'|'TP'|'LIQ' }]
+// GET /by-bucket?asset=1&bucket=20500000&type=stops&stopType=SL|TP|LIQ&side=long|short&sort=type|id
 app.get('/by-bucket', async (req, res) => {
   try {
     const asset  = intParam(req.query.asset, 'asset');
     const bucket = intParam(req.query.bucket, 'bucket');
-    const type   = String(req.query.type || 'order').toLowerCase();
-    const sort   = String(req.query.sort || '').toLowerCase();
+    const type   = String(req.query.type || 'order').toLowerCase();  // 'order' | 'stops'
+    const sort   = String(req.query.sort || '').toLowerCase();       // 'type' | 'id'
     const stopTypeStr = req.query.stopType ? String(req.query.stopType).toUpperCase() : null;
+    const sideParam = req.query.side ? String(req.query.side).toLowerCase() : null; // long|short
 
     if (!['order', 'stops'].includes(type)) {
       return res.status(400).json({ error: 'type must be "order" or "stops"' });
     }
 
     if (type === 'order') {
-      const rows = await get(`order_buckets?asset_id=eq.${asset}&bucket_id=eq.${bucket}&select=position_id`);
-      let ids = (rows || []).map((r) => Number(r.position_id));
-      if (sort === 'id') ids = ids.sort((a, b) => a - b);
-      return res.json({ asset, bucket, kind: 'ORDER', items: ids.map((id) => ({ id })) });
+      let q = `order_buckets?asset_id=eq.${asset}&bucket_id=eq.${bucket}&select=position_id,lots,side`;
+      if (sideParam === 'long')  q += `&side=eq.true`;
+      if (sideParam === 'short') q += `&side=eq.false`;
+
+      const rows = await get(q);
+      let items = (rows || []).map(r => ({
+        id: Number(r.position_id),
+        lots: Number(r.lots || 0),
+        side: r.side ? 'LONG' : 'SHORT'
+      }));
+      if (sort === 'id') items.sort((a, b) => a.id - b.id);
+      return res.json({ asset, bucket, kind: 'ORDER', items });
     }
 
     // stops
-    let q = `stop_buckets?asset_id=eq.${asset}&bucket_id=eq.${bucket}&select=position_id,stop_type`;
+    let q = `stop_buckets?asset_id=eq.${asset}&bucket_id=eq.${bucket}&select=position_id,stop_type,lots,side`;
     if (stopTypeStr) {
       const t = STOP_LABEL_TO_INT[stopTypeStr];
       if (!t) return res.status(400).json({ error: 'stopType must be SL|TP|LIQ' });
       q += `&stop_type=eq.${t}`;
     }
+    if (sideParam === 'long')  q += `&side=eq.true`;
+    if (sideParam === 'short') q += `&side=eq.false`;
 
     let rows = await get(q);
     let items = (rows || []).map((r) => ({
       id: Number(r.position_id),
-      type: STOP_INT_TO_LABEL[Number(r.stop_type)] || 'UNK'
+      type: STOP_INT_TO_LABEL[Number(r.stop_type)] || 'UNK',
+      lots: Number(r.lots || 0),
+      side: r.side ? 'LONG' : 'SHORT'
     }));
 
     if (sort === 'type') {
@@ -153,7 +158,6 @@ app.get('/by-bucket', async (req, res) => {
 
 // ---------- 5) Détails d’une position par ID ----------
 // GET /position/:id
-// -> retourne la ligne complète depuis `positions` (404 si non trouvé)
 app.get('/position/:id', async (req, res) => {
   try {
     const idNum = intParam(req.params.id, 'id');
@@ -167,6 +171,11 @@ app.get('/position/:id', async (req, res) => {
     res.status(500).json({ error: 'internal_error' });
   }
 });
+
+app.listen(PORT, () => {
+  logInfo('API+', `listening on http://0.0.0.0:${PORT}`);
+});
+
 
 app.listen(PORT, () => {
   logInfo('API+', `listening on http://0.0.0.0:${PORT}`);
