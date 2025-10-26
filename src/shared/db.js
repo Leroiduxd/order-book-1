@@ -8,12 +8,10 @@ import { logInfo } from './logger.js';
 const BI = (x) => BigInt(x);
 const divFloor = (a, b) => a / b;
 const mulDivFloor = (a, b, c) => (a * b) / c;
-
-// stringify sûr pour ids potentiellement grands (bigint)
 const idStr = (x) => (typeof x === 'bigint' ? x.toString() : String(x));
 
 /* =========================================================
-   Assets cache (schema: assets.asset_id, tick_size_usd6, lot_num, lot_den)
+   Assets cache (assets.asset_id, tick_size_usd6, lot_num, lot_den)
 ========================================================= */
 const assetCache = new Map();
 export async function getAsset(asset_id) {
@@ -80,6 +78,7 @@ async function indexStops({ asset_id, position_id, sl_x6, tp_x6, liq_x6, long_si
    - positions: upsert (⚠️ ne PAS envoyer trader_addr_lc — colonne générée)
    - state=0: order_buckets upsert (target) avec lots + side=longSide
    - state=1: stop_buckets upsert (SL/TP/LIQ) lots + side=!longSide
+   (les triggers Postgres maintiennent exposure_agg automatiquement)
 ========================================================= */
 export async function upsertOpenedEvent(ev) {
   const {
@@ -105,7 +104,7 @@ export async function upsertOpenedEvent(ev) {
     margin_usd6   = calc.margin_usd6;
   }
 
-  // 1) UPSERT position (pas de trader_addr_lc ici)
+  // 1) UPSERT position
   await postArray('positions?on_conflict=id', [
     {
       id: idStr(id),
@@ -156,6 +155,7 @@ export async function upsertOpenedEvent(ev) {
     });
   }
 
+  // ⚠️ Les agrégats exposure_agg sont MAJ par trigger quand state=1
   logInfo('DB', `Opened upserted id=${idStr(id)} state=${state} (indexed=${Number(state)===0?'order':'stops'})`);
 }
 
@@ -164,6 +164,7 @@ export async function upsertOpenedEvent(ev) {
    - update position: state=1, entry_x6, notional/margin
    - delete order_buckets
    - (re)index SL/TP/LIQ antagonistes
+   (trigger mettra à jour exposure_agg car state passe à 1)
 ========================================================= */
 export async function handleExecutedEvent(ev) {
   const { id, entryX6 } = ev;
@@ -182,7 +183,7 @@ export async function handleExecutedEvent(ev) {
     lot_den: assetRow.lot_den
   });
 
-  // 1) Update position
+  // 1) Update position -> triggers: ajoute à exposure_agg (état devient OPEN)
   await patch(
     `positions?id=eq.${idStr(id)}`,
     {
@@ -216,6 +217,7 @@ export async function handleExecutedEvent(ev) {
    - update SL/TP (pas LIQ)
    - delete stop_buckets (types 1,2), conserve LIQ (3)
    - re-index SL/TP antagonistes
+   (exposure_agg ne change pas ici sauf si tu changes liq_x6)
 ========================================================= */
 export async function handleStopsUpdatedEvent(ev) {
   const { id, slX6, tpX6 } = ev;
@@ -251,6 +253,7 @@ export async function handleStopsUpdatedEvent(ev) {
    REMOVED (fermeture ou annulation)
    - update position: state=2, close_reason, exec_x6, pnl_usd6
    - delete tous les stops
+   (trigger soustrait l'expo si la position était OPEN)
 ========================================================= */
 export async function handleRemovedEvent(ev) {
   const { id, reason, execX6, pnlUsd6 } = ev;
