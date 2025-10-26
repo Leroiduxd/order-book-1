@@ -1,3 +1,4 @@
+// src/stopsUpdated.js
 import { ABI } from './shared/abi.js';
 import { makeProvider, makeContract } from './shared/provider.js';
 import { handleStopsUpdatedEvent } from './shared/db.js';
@@ -15,7 +16,7 @@ async function main() {
     try {
       await handleStopsUpdatedEvent(
         { id, slX6, tpX6 },
-        { txHash: evt.transactionHash, blockNum: evt.blockNumber }
+        { txHash: evt.transactionHash, blockNum: evt.blockNumber } // ignoré par la fonction, ok
       );
       logInfo(TAG, `stored id=${id} slX6=${slX6} tpX6=${tpX6} @ block=${evt.blockNumber} tx=${evt.transactionHash} logIndex=${evt.logIndex}`);
     } catch (e) {
