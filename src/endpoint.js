@@ -1,29 +1,30 @@
+// src/endpoint.js
 import 'dotenv/config';
 import express from 'express';
-import { get } from './shared/rest.js'; // <-- utilise le helper PostgREST qu’on a ajouté
+import { get } from './shared/rest.js';
 import { logInfo, logErr } from './shared/logger.js';
 
 const app = express();
-const PORT = 7392
-// --------- helpers ---------
-const isHexAddr = (s) => /^0x[a-fA-F0-9]{40}$/.test(String(s || ''));
-const toLower0x = (s) => String(s || '').toLowerCase();
 
+/** Configure ton port public ici (exposé sur le VPS) */
+const PORT = Number(process.env.PORT_EXTRA || 7392);
+
+// ---------- Helpers ----------
+const isHexAddr = (s) => /^0x[a-fA-F0-9]{40}$/.test(String(s || ''));
 const STOP_LABEL_TO_INT = { SL: 1, TP: 2, LIQ: 3 };
 const STOP_INT_TO_LABEL = { 1: 'SL', 2: 'TP', 3: 'LIQ' };
 
-function parseIntParam(v, name) {
+function intParam(v, name) {
   const n = Number(v);
   if (!Number.isInteger(n)) throw new Error(`${name} must be an integer`);
   return n;
 }
 
-// ========= 1) Assets list =========
+// ---------- 1) Assets list ----------
 // GET /assets
-// -> retourne la liste des actifs listés (tout le contenu de la table assets)
+// Retourne la liste des actifs (adapter les colonnes si besoin)
 app.get('/assets', async (_req, res) => {
   try {
-    // adapte les colonnes si tu en as d’autres (symbol, etc.)
     const rows = await get('assets?select=asset_id,symbol,tick_size_usd6,lot_num,lot_den&order=asset_id.asc');
     res.json(rows || []);
   } catch (e) {
@@ -32,21 +33,20 @@ app.get('/assets', async (_req, res) => {
   }
 });
 
-// ========= 2) IDs d’un trader =========
+// ---------- 2) IDs d’un trader ----------
 // GET /trader/:addr/ids
 // -> { trader, orders:[], open:[], cancelled:[], closed:[] }
 app.get('/trader/:addr/ids', async (req, res) => {
   try {
     const addr = String(req.params.addr || '').trim();
     if (!isHexAddr(addr)) return res.status(400).json({ error: 'invalid address' });
-    const a = toLower0x(addr);
+    const addrLc = addr.toLowerCase();
 
-    // states: 0=ORDER, 1=OPEN, 2=CLOSED/CANCELLED (distingués par close_reason)
     const [orders, open, closedAll, cancelled] = await Promise.all([
-      get(`positions?trader_addr=eq.${a}&state=eq.0&select=id&order=id.asc`),
-      get(`positions?trader_addr=eq.${a}&state=eq.1&select=id&order=id.asc`),
-      get(`positions?trader_addr=eq.${a}&state=eq.2&select=id,close_reason&order=id.asc`),
-      get(`positions?trader_addr=eq.${a}&state=eq.2&close_reason=eq.0&select=id&order=id.asc`)
+      get(`positions?trader_addr_lc=eq.${addrLc}&state=eq.0&select=id&order=id.asc`),
+      get(`positions?trader_addr_lc=eq.${addrLc}&state=eq.1&select=id&order=id.asc`),
+      get(`positions?trader_addr_lc=eq.${addrLc}&state=eq.2&select=id,close_reason&order=id.asc`),
+      get(`positions?trader_addr_lc=eq.${addrLc}&state=eq.2&close_reason=eq.0&select=id&order=id.asc`)
     ]);
 
     const closed = (closedAll || [])
@@ -54,7 +54,7 @@ app.get('/trader/:addr/ids', async (req, res) => {
       .map((r) => r.id);
 
     res.json({
-      trader: a,
+      trader: addrLc,
       orders: (orders || []).map((r) => r.id),
       open: (open || []).map((r) => r.id),
       cancelled: (cancelled || []).map((r) => r.id),
@@ -66,25 +66,24 @@ app.get('/trader/:addr/ids', async (req, res) => {
   }
 });
 
-// ========= 3) Infos d’un trader =========
+// ---------- 3) Infos d’un trader (compteurs) ----------
 // GET /trader/:addr
-// -> { trader, counts: { orders, open, cancelled, closed }, positions?: [...] (optionnel) }
+// -> { trader, counts: { orders, open, cancelled, closed } }
 app.get('/trader/:addr', async (req, res) => {
   try {
     const addr = String(req.params.addr || '').trim();
     if (!isHexAddr(addr)) return res.status(400).json({ error: 'invalid address' });
-    const a = toLower0x(addr);
+    const addrLc = addr.toLowerCase();
 
-    // on calcule des compteurs simples
     const [orders, open, cancelled, closed] = await Promise.all([
-      get(`positions?trader_addr=eq.${a}&state=eq.0&select=id`),
-      get(`positions?trader_addr=eq.${a}&state=eq.1&select=id`),
-      get(`positions?trader_addr=eq.${a}&state=eq.2&close_reason=eq.0&select=id`),
-      get(`positions?trader_addr=eq.${a}&state=eq.2&close_reason=not.is.null&close_reason=neq.0&select=id`)
+      get(`positions?trader_addr_lc=eq.${addrLc}&state=eq.0&select=id`),
+      get(`positions?trader_addr_lc=eq.${addrLc}&state=eq.1&select=id`),
+      get(`positions?trader_addr_lc=eq.${addrLc}&state=eq.2&close_reason=eq.0&select=id`),
+      get(`positions?trader_addr_lc=eq.${addrLc}&state=eq.2&close_reason=not.is.null&close_reason=neq.0&select=id`)
     ]);
 
     res.json({
-      trader: a,
+      trader: addrLc,
       counts: {
         orders: orders?.length || 0,
         open: open?.length || 0,
@@ -98,19 +97,18 @@ app.get('/trader/:addr', async (req, res) => {
   }
 });
 
-// ========= 4) Par bucket (orders / stops) =========
+// ---------- 4) Par bucket (orders / stops) ----------
 // GET /by-bucket?asset=1&bucket=20500000&type=order
 // GET /by-bucket?asset=1&bucket=20500000&type=stops&stopType=SL|TP|LIQ&sort=type|id
 //
-// type=order  -> retourne { items: [{ id }] } depuis order_buckets
-// type=stops  -> retourne { items: [{ id, type: 'SL'|'TP'|'LIQ' }] } depuis stop_buckets
-// tri: sort=type (ordre SL,TP,LIQ), sort=id (par id asc), ou naturel par défaut
+// type=order  -> items: [{ id }]
+// type=stops  -> items: [{ id, type: 'SL'|'TP'|'LIQ' }]
 app.get('/by-bucket', async (req, res) => {
   try {
-    const asset  = parseIntParam(req.query.asset, 'asset');
-    const bucket = parseIntParam(req.query.bucket, 'bucket');
-    const type   = String(req.query.type || 'order').toLowerCase();  // 'order' | 'stops'
-    const sort   = String(req.query.sort || '').toLowerCase();       // 'type' | 'id' | ''
+    const asset  = intParam(req.query.asset, 'asset');
+    const bucket = intParam(req.query.bucket, 'bucket');
+    const type   = String(req.query.type || 'order').toLowerCase();
+    const sort   = String(req.query.sort || '').toLowerCase();
     const stopTypeStr = req.query.stopType ? String(req.query.stopType).toUpperCase() : null;
 
     if (!['order', 'stops'].includes(type)) {
@@ -146,6 +144,23 @@ app.get('/by-bucket', async (req, res) => {
     }
 
     res.json({ asset, bucket, kind: 'STOPS', items });
+  } catch (e) {
+    logErr('API+', e);
+    if (/must be an integer/.test(String(e.message))) return res.status(400).json({ error: e.message });
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+// ---------- 5) Détails d’une position par ID ----------
+// GET /position/:id
+// -> retourne la ligne complète depuis `positions` (404 si non trouvé)
+app.get('/position/:id', async (req, res) => {
+  try {
+    const idNum = intParam(req.params.id, 'id');
+    const rows = await get(`positions?id=eq.${idNum}`);
+    const row = rows?.[0];
+    if (!row) return res.status(404).json({ error: 'position_not_found' });
+    res.json(row);
   } catch (e) {
     logErr('API+', e);
     if (/must be an integer/.test(String(e.message))) return res.status(400).json({ error: e.message });
