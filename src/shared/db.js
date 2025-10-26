@@ -1,5 +1,4 @@
-// src/shared/db.js — version "même logique que Supabase", mais via pg + SQL
-import { query } from './pg.js';
+import { get, postArray, patch, del } from './rest.js';
 import { logInfo, logErr } from './logger.js';
 
 /* =========================================================
@@ -10,22 +9,18 @@ const divFloor = (a, b) => a / b;
 const mulDivFloor = (a, b, c) => (a * b) / c;
 
 /* =========================================================
-   Cache assets  (schema: assets.asset_id, assets.tick_size_usd6, lot_num, lot_den)
+   Assets cache (tick/lot)  (schema: assets.asset_id, tick_size_usd6, lot_num, lot_den)
 ========================================================= */
 const assetCache = new Map();
 export async function getAsset(asset_id) {
   const k = Number(asset_id);
   if (assetCache.has(k)) return assetCache.get(k);
 
-  const { rows } = await query(
-    `select asset_id, tick_size_usd6, lot_num, lot_den
-       from public.assets
-      where asset_id = $1`,
-    [k]
-  );
-  if (!rows.length) throw new Error(`Asset ${k} introuvable dans DB (table assets)`);
-  assetCache.set(k, rows[0]);
-  return rows[0];
+  const rows = await get(`assets?asset_id=eq.${k}&select=asset_id,tick_size_usd6,lot_num,lot_den`);
+  const row = rows?.[0];
+  if (!row) throw new Error(`Asset ${k} introuvable (table assets)`);
+  assetCache.set(k, row);
+  return row;
 }
 
 /* =========================================================
@@ -37,18 +32,16 @@ function computeNotionalAndMargin({ entry_x6, lots, leverage_x, lot_num, lot_den
   const lotNum  = BI(lot_num ?? 1);
   const lotDen  = BI(lot_den ?? 1);
   const lev     = BI(leverage_x);
-
   const qty_num = lotsBI * lotNum;
   const qty_den = lotDen;
 
   const notional = mulDivFloor(entry, qty_num, qty_den);
   const margin   = divFloor(notional, lev);
-
   return { notional_usd6: notional.toString(), margin_usd6: margin.toString() };
 }
 
 /* =========================================================
-   Indexation des stops (SL/TP/LIQ) via UPSERT SQL
+   Indexation des stops (SL/TP/LIQ) via UPSERT PostgREST
 ========================================================= */
 async function indexStops({ asset_id, position_id, sl_x6, tp_x6, liq_x6 }) {
   const asset = await getAsset(Number(asset_id));
@@ -59,15 +52,19 @@ async function indexStops({ asset_id, position_id, sl_x6, tp_x6, liq_x6 }) {
   if (Number(tp_x6)  !== 0) rows.push({ px: BI(tp_x6),  type: 2 }); // TP
   if (Number(liq_x6) !== 0) rows.push({ px: BI(liq_x6), type: 3 }); // LIQ
 
-  for (const r of rows) {
-    const bucket_id = divFloor(r.px, tick).toString();
-    await query(
-      `insert into public.stop_buckets(asset_id, bucket_id, position_id, stop_type)
-       values ($1::int, $2::bigint, $3::bigint, $4::smallint)
-       on conflict (asset_id, bucket_id, position_id, stop_type) do nothing`,
-      [Number(asset_id), bucket_id, Number(position_id), r.type]
-    );
-  }
+  if (!rows.length) return;
+
+  const payload = rows.map(r => ({
+    asset_id: Number(asset_id),
+    bucket_id: divFloor(r.px, tick).toString(),
+    position_id: Number(position_id),
+    stop_type: r.type
+  }));
+
+  await postArray(
+    'stop_buckets?on_conflict=asset_id,bucket_id,position_id,stop_type',
+    payload
+  );
 }
 
 /* =========================================================
@@ -101,59 +98,39 @@ export async function upsertOpenedEvent(ev) {
   }
 
   // 1) UPSERT position
-  await query(
-    `insert into public.positions(
-       id, state, asset_id, trader_addr, long_side, lots, leverage_x,
-       entry_x6, target_x6, sl_x6, tp_x6, liq_x6, notional_usd6, margin_usd6
-     )
-     values (
-       $1::bigint, $2::int, $3::int, $4::text, $5::boolean, $6::smallint, $7::smallint,
-       case when $2::int=1 then $8::bigint else null end,
-       case when $2::int=0 then $8::bigint else null end,
-       $9::bigint, $10::bigint, $11::bigint, $12::bigint, $13::bigint
-     )
-     on conflict (id) do update
-     set state=$2::int,
-         entry_x6=case when $2::int=1 then $8::bigint else null end,
-         target_x6=case when $2::int=0 then $8::bigint else null end,
-         sl_x6=$9::bigint,
-         tp_x6=$10::bigint,
-         liq_x6=$11::bigint,
-         notional_usd6=$12::bigint,
-         margin_usd6=$13::bigint`,
-    [
-      Number(id),
-      Number(state),
-      Number(asset),
-      String(trader),
-      Boolean(longSide),
-      Number(lots),
-      Number(leverageX),
-      BigInt(entryOrTargetX6).toString(),
-      BigInt(slX6 ?? 0).toString(),
-      BigInt(tpX6 ?? 0).toString(),
-      BigInt(liqX6 ?? 0).toString(),
-      notional_usd6 ? BigInt(notional_usd6).toString() : null,
-      margin_usd6   ? BigInt(margin_usd6).toString()   : null,
-    ]
-  );
+  await postArray('positions?on_conflict=id', [
+    {
+      id: Number(id),
+      state: Number(state),
+      asset_id: Number(asset),
+      trader_addr: String(trader),
+      long_side: Boolean(longSide),
+      lots: Number(lots),
+      leverage_x: Number(leverageX),
+      entry_x6: Number(state) === 1 ? BI(entryOrTargetX6).toString() : null,
+      target_x6: Number(state) === 0 ? BI(entryOrTargetX6).toString() : null,
+      sl_x6: BI(slX6 ?? 0).toString(),
+      tp_x6: BI(tpX6 ?? 0).toString(),
+      liq_x6: BI(liqX6 ?? 0).toString(),
+      notional_usd6: notional_usd6 ? BI(notional_usd6).toString() : null,
+      margin_usd6:   margin_usd6   ? BI(margin_usd6).toString()   : null
+    }
+  ]);
 
   // 2) Index
   if (Number(state) === 0) {
-    // ORDER -> order_buckets
+    // ORDER -> index target dans order_buckets (UPSERT)
     const tick   = BI(assetRow.tick_size_usd6);
     const price  = BI(entryOrTargetX6);
     const bucket = divFloor(price, tick).toString();
 
-    await query(
-      `insert into public.order_buckets(asset_id, bucket_id, position_id)
-       values ($1::int, $2::bigint, $3::bigint)
-       on conflict (asset_id, bucket_id, position_id) do nothing`,
-      [Number(asset), bucket, Number(id)]
+    await postArray(
+      'order_buckets?on_conflict=asset_id,bucket_id,position_id',
+      [{ asset_id: Number(asset), bucket_id: bucket, position_id: Number(id) }]
     );
   } else {
-    // OPEN -> (re)index SL/TP/LIQ
-    await query(`delete from public.stop_buckets where position_id=$1::bigint`, [Number(id)]);
+    // OPEN -> (re)indexer SL/TP/LIQ
+    await del(`stop_buckets?position_id=eq.${Number(id)}`);
     await indexStops({
       asset_id: Number(asset),
       position_id: Number(id),
@@ -168,21 +145,16 @@ export async function upsertOpenedEvent(ev) {
 
 /* =========================================================
    EXECUTED (ORDER -> OPEN)
-   - positions: update state=1, entry_x6, notional/margin
+   - update position: state=1, entry_x6, notional/margin
    - delete order_buckets
    - (re)index SL/TP/LIQ
 ========================================================= */
 export async function handleExecutedEvent(ev) {
   const { id, entryX6 } = ev;
 
-  // Lire position pour lots, leverage, asset, stops
-  const { rows: posRows } = await query(
-    `select asset_id, lots, leverage_x, sl_x6, tp_x6, liq_x6
-       from public.positions
-      where id=$1::bigint`,
-    [Number(id)]
-  );
-  const pos = posRows[0];
+  // Lire position pour lots, leverage, asset, stops actuels
+  const rows = await get(`positions?id=eq.${Number(id)}&select=asset_id,lots,leverage_x,sl_x6,tp_x6,liq_x6`);
+  const pos = rows?.[0];
   if (!pos) throw new Error(`Position ${id} introuvable pour Executed`);
 
   const assetRow = await getAsset(Number(pos.asset_id));
@@ -194,19 +166,22 @@ export async function handleExecutedEvent(ev) {
     lot_den: assetRow.lot_den
   });
 
-  await query(
-    `update public.positions
-        set state=1,
-            entry_x6=$2::bigint,
-            notional_usd6=$3::bigint,
-            margin_usd6=$4::bigint
-      where id=$1::bigint`,
-    [Number(id), BigInt(entryX6).toString(), BigInt(calc.notional_usd6).toString(), BigInt(calc.margin_usd6).toString()]
+  // 1) Update position (PATCH avec filtre)
+  await patch(
+    `positions?id=eq.${Number(id)}`,
+    {
+      state: 1,
+      entry_x6: BI(entryX6).toString(),
+      notional_usd6: BI(calc.notional_usd6).toString(),
+      margin_usd6:   BI(calc.margin_usd6).toString()
+    }
   );
 
-  await query(`delete from public.order_buckets where position_id=$1::bigint`, [Number(id)]);
-  await query(`delete from public.stop_buckets where position_id=$1::bigint`, [Number(id)]);
+  // 2) Retirer des order_buckets
+  await del(`order_buckets?position_id=eq.${Number(id)}`);
 
+  // 3) (Ré)indexer SL/TP/LIQ
+  await del(`stop_buckets?position_id=eq.${Number(id)}`);
   await indexStops({
     asset_id: Number(pos.asset_id),
     position_id: Number(id),
@@ -222,33 +197,26 @@ export async function handleExecutedEvent(ev) {
    STOPS UPDATED
    - update SL/TP (pas LIQ)
    - delete stop_buckets (types 1,2), conserve LIQ (3)
-   - re-index SL/TP
+   - re-index SL/TP (upsert)
 ========================================================= */
 export async function handleStopsUpdatedEvent(ev) {
   const { id, slX6, tpX6 } = ev;
 
-  const { rows: posRows } = await query(
-    `select asset_id, liq_x6 from public.positions where id=$1::bigint`,
-    [Number(id)]
-  );
-  const pos = posRows[0];
+  // Lire position pour asset_id
+  const rows = await get(`positions?id=eq.${Number(id)}&select=asset_id,liq_x6`);
+  const pos = rows?.[0];
   if (!pos) throw new Error(`Position ${id} introuvable pour StopsUpdated`);
 
-  await query(
-    `update public.positions
-        set sl_x6=$2::bigint,
-            tp_x6=$3::bigint
-      where id=$1::bigint`,
-    [Number(id), BigInt(slX6 ?? 0).toString(), BigInt(tpX6 ?? 0).toString()]
+  // 1) Update SL/TP
+  await patch(
+    `positions?id=eq.${Number(id)}`,
+    { sl_x6: BI(slX6 ?? 0).toString(), tp_x6: BI(tpX6 ?? 0).toString() }
   );
 
-  await query(
-    `delete from public.stop_buckets
-      where position_id=$1::bigint
-        and stop_type in (1,2)`, // SL, TP
-    [Number(id)]
-  );
+  // 2) Supprimer SL/TP, conserver LIQ
+  await del(`stop_buckets?position_id=eq.${Number(id)}&stop_type=in.(1,2)`);
 
+  // 3) Réindexer SL/TP
   await indexStops({
     asset_id: Number(pos.asset_id),
     position_id: Number(id),
@@ -268,17 +236,18 @@ export async function handleStopsUpdatedEvent(ev) {
 export async function handleRemovedEvent(ev) {
   const { id, reason, execX6, pnlUsd6 } = ev;
 
-  await query(
-    `update public.positions
-        set state=2,
-            close_reason=$2::int,
-            exec_x6=$3::bigint,
-            pnl_usd6=$4::numeric
-      where id=$1::bigint`,
-    [Number(id), Number(reason), BigInt(execX6 ?? 0).toString(), String(pnlUsd6 ?? 0)]
+  await patch(
+    `positions?id=eq.${Number(id)}`,
+    {
+      state: 2,
+      close_reason: Number(reason),
+      exec_x6: BI(execX6 ?? 0).toString(),
+      pnl_usd6: String(pnlUsd6 ?? 0)
+    }
   );
 
-  await query(`delete from public.stop_buckets where position_id=$1::bigint`, [Number(id)]);
+  await del(`stop_buckets?position_id=eq.${Number(id)}`);
 
   logInfo('DB', `Removed id=${id} reason=${reason} execX6=${execX6} pnlUsd6=${pnlUsd6}`);
 }
+
