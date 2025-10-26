@@ -1,182 +1,138 @@
-// src/endpoint.js
+// ===============================================
+// BROKEX — Public API (endpoint.js)
+// ===============================================
+
 import 'dotenv/config';
 import express from 'express';
+import cors from 'cors';
 import { get } from './shared/rest.js';
 import { logInfo, logErr } from './shared/logger.js';
 
 const app = express();
+app.use(cors());
+app.use(express.json());
+
+const ENDPOINT = process.env.ENDPOINT || 'http://127.0.0.1:9304';
 const PORT = Number(process.env.PORT_EXTRA || 7392);
 
-// ---------- Helpers ----------
-const isHexAddr = (s) => /^0x[a-fA-F0-9]{40}$/.test(String(s || ''));
-const STOP_LABEL_TO_INT = { SL: 1, TP: 2, LIQ: 3 };
-const STOP_INT_TO_LABEL = { 1: 'SL', 2: 'TP', 3: 'LIQ' };
+console.log('[REST] Using PostgREST ENDPOINT =', ENDPOINT);
+console.log('[API+] PORT =', PORT);
 
-function intParam(v, name) {
-  const n = Number(v);
-  if (!Number.isInteger(n)) throw new Error(`${name} must be an integer`);
-  return n;
-}
-
-// ---------- 1) Assets list ----------
-// GET /assets
-app.get('/assets', async (_req, res) => {
+// =========================================================
+// Endpoint: GET /assets
+// =========================================================
+app.get('/assets', async (req, res) => {
   try {
-    const rows = await get('assets?select=asset_id,symbol,tick_size_usd6,lot_num,lot_den&order=asset_id.asc');
-    res.json(rows || []);
-  } catch (e) {
-    logErr('API+', e);
+    const rows = await get('assets?select=*');
+    res.json(rows);
+  } catch (err) {
+    logErr('API /assets', err);
     res.status(500).json({ error: 'internal_error' });
   }
 });
 
-// ---------- 2) IDs d’un trader ----------
-// GET /trader/:addr/ids
+// =========================================================
+// Endpoint: GET /trader/:addr/ids
+// Renvoie les IDs groupés par state pour un trader
+// =========================================================
 app.get('/trader/:addr/ids', async (req, res) => {
   try {
-    const addr = String(req.params.addr || '').trim();
-    if (!isHexAddr(addr)) return res.status(400).json({ error: 'invalid address' });
-    const addrLc = addr.toLowerCase();
+    const addr = String(req.params.addr).toLowerCase();
+    if (!addr.match(/^0x[a-f0-9]{40}$/)) {
+      return res.status(400).json({ error: 'invalid address (lowercase expected)' });
+    }
 
-    const [orders, open, closedAll, cancelled] = await Promise.all([
-      get(`positions?trader_addr_lc=eq.${addrLc}&state=eq.0&select=id&order=id.asc`),
-      get(`positions?trader_addr_lc=eq.${addrLc}&state=eq.1&select=id&order=id.asc`),
-      get(`positions?trader_addr_lc=eq.${addrLc}&state=eq.2&select=id,close_reason&order=id.asc`),
-      get(`positions?trader_addr_lc=eq.${addrLc}&state=eq.2&close_reason=eq.0&select=id&order=id.asc`)
-    ]);
+    const rows = await get(`positions?trader_addr_lc=eq.${addr}&select=id,state,close_reason&order=id.asc`);
+    const grouped = { orders: [], open: [], closed: [], cancelled: [] };
 
-    const closed = (closedAll || [])
-      .filter((r) => r.close_reason !== null && r.close_reason !== 0)
-      .map((r) => r.id);
+    for (const r of rows) {
+      if (r.state === 0) grouped.orders.push(r.id);
+      else if (r.state === 1) grouped.open.push(r.id);
+      else if (r.state === 2 && r.close_reason === 0) grouped.cancelled.push(r.id);
+      else if (r.state === 2) grouped.closed.push(r.id);
+    }
 
-    res.json({
-      trader: addrLc,
-      orders: (orders || []).map((r) => r.id),
-      open: (open || []).map((r) => r.id),
-      cancelled: (cancelled || []).map((r) => r.id),
-      closed
-    });
-  } catch (e) {
-    logErr('API+', e);
+    res.json({ trader: addr, ...grouped });
+  } catch (err) {
+    logErr('API /trader/:addr/ids', err);
     res.status(500).json({ error: 'internal_error' });
   }
 });
 
-// ---------- 3) Infos d’un trader (compteurs) ----------
-// GET /trader/:addr
+// =========================================================
+// Endpoint: GET /trader/:addr
+// Renvoie les positions complètes d’un trader
+// =========================================================
 app.get('/trader/:addr', async (req, res) => {
   try {
-    const addr = String(req.params.addr || '').trim();
-    if (!isHexAddr(addr)) return res.status(400).json({ error: 'invalid address' });
-    const addrLc = addr.toLowerCase();
+    const addr = String(req.params.addr).toLowerCase();
+    if (!addr.match(/^0x[a-f0-9]{40}$/)) {
+      return res.status(400).json({ error: 'invalid address (lowercase expected)' });
+    }
 
-    const [orders, open, cancelled, closed] = await Promise.all([
-      get(`positions?trader_addr_lc=eq.${addrLc}&state=eq.0&select=id`),
-      get(`positions?trader_addr_lc=eq.${addrLc}&state=eq.1&select=id`),
-      get(`positions?trader_addr_lc=eq.${addrLc}&state=eq.2&close_reason=eq.0&select=id`),
-      get(`positions?trader_addr_lc=eq.${addrLc}&state=eq.2&close_reason=not.is.null&close_reason=neq.0&select=id`)
-    ]);
-
-    res.json({
-      trader: addrLc,
-      counts: {
-        orders: orders?.length || 0,
-        open: open?.length || 0,
-        cancelled: cancelled?.length || 0,
-        closed: closed?.length || 0
-      }
-    });
-  } catch (e) {
-    logErr('API+', e);
+    const rows = await get(
+      `positions?trader_addr_lc=eq.${addr}&select=id,state,asset_id,long_side,lots,leverage_x,entry_x6,target_x6,sl_x6,tp_x6,liq_x6,close_reason,exec_x6,pnl_usd6,notional_usd6,margin_usd6,created_at,updated_at&order=id.asc`
+    );
+    res.json(rows);
+  } catch (err) {
+    logErr('API /trader/:addr', err);
     res.status(500).json({ error: 'internal_error' });
   }
 });
 
-// ---------- 4) Par bucket (orders / stops) ----------
-// GET /by-bucket?asset=1&bucket=20500000&type=order
-// GET /by-bucket?asset=1&bucket=20500000&type=stops&stopType=SL|TP|LIQ&side=long|short&sort=type|id
-app.get('/by-bucket', async (req, res) => {
-  try {
-    const asset  = intParam(req.query.asset, 'asset');
-    const bucket = intParam(req.query.bucket, 'bucket');
-    const type   = String(req.query.type || 'order').toLowerCase();  // 'order' | 'stops'
-    const sort   = String(req.query.sort || '').toLowerCase();       // 'type' | 'id'
-    const stopTypeStr = req.query.stopType ? String(req.query.stopType).toUpperCase() : null;
-    const sideParam = req.query.side ? String(req.query.side).toLowerCase() : null; // long|short
-
-    if (!['order', 'stops'].includes(type)) {
-      return res.status(400).json({ error: 'type must be "order" or "stops"' });
-    }
-
-    if (type === 'order') {
-      let q = `order_buckets?asset_id=eq.${asset}&bucket_id=eq.${bucket}&select=position_id,lots,side`;
-      if (sideParam === 'long')  q += `&side=eq.true`;
-      if (sideParam === 'short') q += `&side=eq.false`;
-
-      const rows = await get(q);
-      let items = (rows || []).map(r => ({
-        id: Number(r.position_id),
-        lots: Number(r.lots || 0),
-        side: r.side ? 'LONG' : 'SHORT'
-      }));
-      if (sort === 'id') items.sort((a, b) => a.id - b.id);
-      return res.json({ asset, bucket, kind: 'ORDER', items });
-    }
-
-    // stops
-    let q = `stop_buckets?asset_id=eq.${asset}&bucket_id=eq.${bucket}&select=position_id,stop_type,lots,side`;
-    if (stopTypeStr) {
-      const t = STOP_LABEL_TO_INT[stopTypeStr];
-      if (!t) return res.status(400).json({ error: 'stopType must be SL|TP|LIQ' });
-      q += `&stop_type=eq.${t}`;
-    }
-    if (sideParam === 'long')  q += `&side=eq.true`;
-    if (sideParam === 'short') q += `&side=eq.false`;
-
-    let rows = await get(q);
-    let items = (rows || []).map((r) => ({
-      id: Number(r.position_id),
-      type: STOP_INT_TO_LABEL[Number(r.stop_type)] || 'UNK',
-      lots: Number(r.lots || 0),
-      side: r.side ? 'LONG' : 'SHORT'
-    }));
-
-    if (sort === 'type') {
-      const rank = { SL: 1, TP: 2, LIQ: 3, UNK: 9 };
-      items.sort((a, b) => (rank[a.type] - rank[b.type]) || (a.id - b.id));
-    } else if (sort === 'id') {
-      items.sort((a, b) => a.id - b.id);
-    }
-
-    res.json({ asset, bucket, kind: 'STOPS', items });
-  } catch (e) {
-    logErr('API+', e);
-    if (/must be an integer/.test(String(e.message))) return res.status(400).json({ error: e.message });
-    res.status(500).json({ error: 'internal_error' });
-  }
-});
-
-// ---------- 5) Détails d’une position par ID ----------
-// GET /position/:id
+// =========================================================
+// Endpoint: GET /position/:id
+// Renvoie toutes les infos d’une position précise
+// =========================================================
 app.get('/position/:id', async (req, res) => {
   try {
-    const idNum = intParam(req.params.id, 'id');
-    const rows = await get(`positions?id=eq.${idNum}`);
-    const row = rows?.[0];
-    if (!row) return res.status(404).json({ error: 'position_not_found' });
-    res.json(row);
-  } catch (e) {
-    logErr('API+', e);
-    if (/must be an integer/.test(String(e.message))) return res.status(400).json({ error: e.message });
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return res.status(400).json({ error: 'invalid id' });
+
+    const rows = await get(`positions?id=eq.${id}&select=*`);
+    if (!rows.length) return res.status(404).json({ error: 'not_found' });
+
+    res.json(rows[0]);
+  } catch (err) {
+    logErr('API /position/:id', err);
     res.status(500).json({ error: 'internal_error' });
   }
 });
 
-app.listen(PORT, () => {
-  logInfo('API+', `listening on http://0.0.0.0:${PORT}`);
+// =========================================================
+// Endpoint: GET /by-bucket?asset=0&bucket=10917030&type=order|stops
+// Retourne les positions correspondant à ce bucket
+// =========================================================
+app.get('/by-bucket', async (req, res) => {
+  try {
+    const asset = Number(req.query.asset);
+    const bucket = String(req.query.bucket || '').trim();
+    const type = String(req.query.type || 'order');
+
+    if (!Number.isInteger(asset)) return res.status(400).json({ error: 'asset (int) required' });
+    if (!bucket) return res.status(400).json({ error: 'bucket required' });
+
+    let table = type === 'stops' ? 'stop_buckets' : 'order_buckets';
+    const rows = await get(`${table}?asset_id=eq.${asset}&bucket_id=eq.${bucket}&select=*`);
+    res.json(rows);
+  } catch (err) {
+    logErr('API /by-bucket', err);
+    res.status(500).json({ error: 'internal_error' });
+  }
 });
 
+// =========================================================
+// Anti double-listen guard + startup
+// =========================================================
+if (!global.__BROKEX_ENDPOINT_STARTED__) {
+  global.__BROKEX_ENDPOINT_STARTED__ = true;
 
-app.listen(PORT, () => {
-  logInfo('API+', `listening on http://0.0.0.0:${PORT}`);
-});
+  process.on('unhandledRejection', (err) => console.error('[API+] UnhandledRejection:', err));
+  process.on('uncaughtException', (err) => console.error('[API+] UncaughtException:', err));
+
+  app.listen(PORT, '0.0.0.0', () => {
+    logInfo('BROKEX[API+]', `listening on http://0.0.0.0:${PORT}`);
+  });
+} else {
+  console.log('[API+] listen() skipped (already started)');
+}
