@@ -35,4 +35,3 @@ main().catch((e) => {
   logErr(TAG, e);
   process.exit(1);
 });
-
