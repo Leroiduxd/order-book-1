@@ -1,5 +1,3 @@
-# order-book-1
-
 
 -- ===============================
 -- BROKEX / SUPABASE - MVP SCHEMA
