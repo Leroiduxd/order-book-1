@@ -43,12 +43,80 @@ function ok(res, data) { res.json(data); }
 function bad(res, msg = 'bad_request', code = 400) { res.status(code).json({ error: msg }); }
 
 /* -------------------------------
+   Uniform resolvers (bucket OR price)
+-------------------------------- */
+function isPriceLike(v) {
+  return /\./.test(String(v || '').trim()); // présence d’un point => interprété comme prix
+}
+
+/** Resolve { asset, bucketId } from query.
+ * Accepts: ?asset=0 and one of (?bucket, ?price, ?q)
+ * Priority: bucket > price > q
+ */
+async function resolveAssetAndBucket(q) {
+  const asset = Number(q.asset);
+  if (!Number.isInteger(asset)) throw Object.assign(new Error('asset_required'), { http: 400 });
+
+  const bucketRaw = String(q.bucket || '').trim();
+  const priceRaw  = String(q.price  || '').trim();
+  const qRaw      = String(q.q      || '').trim();
+
+  if (bucketRaw) return { asset, bucketId: bucketRaw };
+
+  if (priceRaw) {
+    const priceX6 = priceStrToX6(priceRaw);
+    const bucketId = await computeBucketId(asset, priceX6);
+    return { asset, bucketId };
+  }
+
+  if (qRaw) {
+    if (isPriceLike(qRaw)) {
+      const priceX6 = priceStrToX6(qRaw);
+      const bucketId = await computeBucketId(asset, priceX6);
+      return { asset, bucketId };
+    }
+    return { asset, bucketId: qRaw };
+  }
+
+  throw Object.assign(new Error('price_or_bucket_required'), { http: 400 });
+}
+
+/** Resolve a [from..to] bucket range from query.
+ * Accepts: ?asset=0 and from/to as prices OR bucket ids.
+ * Aliases supported: from|f|qfrom|bucket_from|price_from, to|t|qto|bucket_to|price_to
+ */
+async function resolveBucketRange(q) {
+  const asset = Number(q.asset);
+  if (!Number.isInteger(asset)) throw Object.assign(new Error('asset_required'), { http: 400 });
+
+  const fromRaw = String(q.from || q.f || q.qfrom || q.bucket_from || q.price_from || '').trim();
+  const toRaw   = String(q.to   || q.t || q.qto   || q.bucket_to   || q.price_to   || '').trim();
+  if (!fromRaw || !toRaw) throw Object.assign(new Error('range_required'), { http: 400 });
+
+  async function toBucketId(v) {
+    if (isPriceLike(v)) {
+      const px6 = priceStrToX6(v);
+      return await computeBucketId(asset, px6);
+    }
+    return String(v);
+  }
+
+  let fromId = await toBucketId(fromRaw);
+  let toId   = await toBucketId(toRaw);
+
+  // normalize (inclusive)
+  if (BigInt(fromId) > BigInt(toId)) {
+    const tmp = fromId; fromId = toId; toId = tmp;
+  }
+  return { asset, fromId, toId };
+}
+
+/* -------------------------------
    Health
 -------------------------------- */
 app.get('/health', async (_req, res) => {
   try {
-    // ping minimal PostgREST
-    await get('assets?select=asset_id&limit=1');
+    await get('assets?select=asset_id&limit=1'); // ping PostgREST
     ok(res, { ok: true });
   } catch (e) {
     logErr('API+', e);
@@ -129,13 +197,12 @@ app.get('/trader/:addr', async (req, res) => {
 });
 
 /* -------------------------------
-   Buckets: orders & stops
-   /bucket/orders?asset=0&price=108910.01   (ou &bucket=12345)
-   /bucket/stops?asset=0&price=108910.01    (ou &bucket=12345)
-   Options:
-     - side=long|short|all (def all)
-     - sort=lots|id  (def lots)
-     - order=desc|asc (def desc)
+   Buckets: single bucket (UNIFORME)
+   Exemples identiques:
+     /bucket/orders?asset=0&bucket=10917030
+     /bucket/orders?asset=0&price=109170.30
+     /bucket/orders?asset=0&q=10917030   (auto)
+     /bucket/orders?asset=0&q=109170.30  (auto)
 -------------------------------- */
 function parseSideFilter(q) {
   const s = String(q.side || 'all').toLowerCase();
@@ -154,38 +221,32 @@ function parseOrder(q) {
 
 app.get('/bucket/orders', async (req, res) => {
   try {
-    const asset = Number(req.query.asset);
-    if (!Number.isInteger(asset)) return bad(res, 'asset_required');
-
-    let bucket = String(req.query.bucket || '').trim();
-    const price = String(req.query.price || '').trim();
-    if (!bucket && !price) return bad(res, 'price_or_bucket_required');
-
-    if (!bucket) {
-      const priceX6 = priceStrToX6(price);
-      bucket = await computeBucketId(asset, priceX6);
-    }
+    const { asset, bucketId } = await resolveAssetAndBucket(req.query);
 
     const side = parseSideFilter(req.query);
     const sort = parseSort(req.query);
     const ord  = parseOrder(req.query);
 
-    // base query
-    let qp = `order_buckets?asset_id=eq.${asset}&bucket_id=eq.${bucket}&select=position_id,lots,side&order=${sort}.${ord}`;
+    let qp = `order_buckets?asset_id=eq.${asset}&bucket_id=eq.${bucketId}` +
+             `&select=position_id,lots,side&order=${sort}.${ord}`;
     if (side !== null) qp += `&side=eq.${side}`;
 
     const rows = await get(qp);
     ok(res, {
       asset,
-      bucket_id: bucket,
+      bucket_id: bucketId,
       count: rows?.length || 0,
       items: (rows || []).map(r => ({
-        id: r.position_id, lots: r.lots ?? 0, side: r.side === true ? 'LONG' : 'SHORT'
+        id: r.position_id,
+        lots: r.lots ?? 0,
+        side: r.side === true ? 'LONG' : 'SHORT'
       }))
     });
   } catch (e) {
-    if (e?.message === 'asset_not_found') return res.status(404).json({ error: 'asset_not_found' });
-    if (e?.message === 'bad_tick')       return res.status(400).json({ error: 'bad_tick' });
+    if (e?.message === 'asset_required')           return res.status(400).json({ error: 'asset_required' });
+    if (e?.message === 'price_or_bucket_required') return res.status(400).json({ error: 'price_or_bucket_required' });
+    if (e?.message === 'asset_not_found')          return res.status(404).json({ error: 'asset_not_found' });
+    if (e?.message === 'bad_tick')                 return res.status(400).json({ error: 'bad_tick' });
     logErr('API+/bucket/orders', e);
     res.status(500).json({ error: 'internal_error' });
   }
@@ -193,23 +254,14 @@ app.get('/bucket/orders', async (req, res) => {
 
 app.get('/bucket/stops', async (req, res) => {
   try {
-    const asset = Number(req.query.asset);
-    if (!Number.isInteger(asset)) return bad(res, 'asset_required');
-
-    let bucket = String(req.query.bucket || '').trim();
-    const price = String(req.query.price || '').trim();
-    if (!bucket && !price) return bad(res, 'price_or_bucket_required');
-
-    if (!bucket) {
-      const priceX6 = priceStrToX6(price);
-      bucket = await computeBucketId(asset, priceX6);
-    }
+    const { asset, bucketId } = await resolveAssetAndBucket(req.query);
 
     const side = parseSideFilter(req.query);
     const sort = parseSort(req.query);
     const ord  = parseOrder(req.query);
 
-    let qp = `stop_buckets?asset_id=eq.${asset}&bucket_id=eq.${bucket}&select=position_id,stop_type,lots,side&order=${sort}.${ord}`;
+    let qp = `stop_buckets?asset_id=eq.${asset}&bucket_id=eq.${bucketId}` +
+             `&select=position_id,stop_type,lots,side&order=${sort}.${ord}`;
     if (side !== null) qp += `&side=eq.${side}`;
 
     const rows = await get(qp);
@@ -217,7 +269,7 @@ app.get('/bucket/stops', async (req, res) => {
 
     ok(res, {
       asset,
-      bucket_id: bucket,
+      bucket_id: bucketId,
       count: rows?.length || 0,
       items: (rows || []).map(r => ({
         id: r.position_id,
@@ -227,9 +279,145 @@ app.get('/bucket/stops', async (req, res) => {
       }))
     });
   } catch (e) {
-    if (e?.message === 'asset_not_found') return res.status(404).json({ error: 'asset_not_found' });
-    if (e?.message === 'bad_tick')       return res.status(400).json({ error: 'bad_tick' });
+    if (e?.message === 'asset_required')           return res.status(400).json({ error: 'asset_required' });
+    if (e?.message === 'price_or_bucket_required') return res.status(400).json({ error: 'price_or_bucket_required' });
+    if (e?.message === 'asset_not_found')          return res.status(404).json({ error: 'asset_not_found' });
+    if (e?.message === 'bad_tick')                 return res.status(400).json({ error: 'bad_tick' });
     logErr('API+/bucket/stops', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+/* -------------------------------
+   Buckets: RANGE (prix OU bucket)
+   Exemples:
+     /bucket/orders-range?asset=0&from=116065.34&to=116095.34
+     /bucket/stops-range?asset=0&from=10917030&to=10917100
+   Options:
+     - side=long|short|all (def all)
+     - sort=lots|id       (def lots)
+     - order=asc|desc     (def desc)
+     - group=1            (retour groupé par bucket_id)
+-------------------------------- */
+app.get('/bucket/orders-range', async (req, res) => {
+  try {
+    const { asset, fromId, toId } = await resolveBucketRange(req.query);
+
+    const side = parseSideFilter(req.query);
+    const sort = parseSort(req.query);
+    const ord  = parseOrder(req.query);
+    const group = String(req.query.group || '').trim() === '1';
+
+    let qp = `order_buckets?asset_id=eq.${asset}&bucket_id=gte.${fromId}&bucket_id=lte.${toId}` +
+             `&select=bucket_id,position_id,lots,side&order=bucket_id.asc,${sort}.${ord}`;
+    if (side !== null) qp += `&side=eq.${side}`;
+
+    const rows = await get(qp) || [];
+
+    if (!group) {
+      return ok(res, {
+        asset,
+        bucket_from: fromId,
+        bucket_to: toId,
+        count: rows.length,
+        items: rows.map(r => ({
+          bucket_id: String(r.bucket_id),
+          id: r.position_id,
+          lots: r.lots ?? 0,
+          side: r.side === true ? 'LONG' : 'SHORT'
+        }))
+      });
+    }
+
+    const byBucket = new Map();
+    for (const r of rows) {
+      const b = String(r.bucket_id);
+      if (!byBucket.has(b)) byBucket.set(b, []);
+      byBucket.get(b).push({
+        id: r.position_id,
+        lots: r.lots ?? 0,
+        side: r.side === true ? 'LONG' : 'SHORT'
+      });
+    }
+    const buckets = Array.from(byBucket.entries()).map(([bucket_id, items]) => ({ bucket_id, items }));
+
+    ok(res, {
+      asset,
+      bucket_from: fromId,
+      bucket_to: toId,
+      bucket_count: buckets.length,
+      item_count: rows.length,
+      buckets
+    });
+  } catch (e) {
+    if (e?.message === 'asset_required')   return res.status(400).json({ error: 'asset_required' });
+    if (e?.message === 'range_required')   return res.status(400).json({ error: 'range_required' });
+    if (e?.message === 'asset_not_found')  return res.status(404).json({ error: 'asset_not_found' });
+    if (e?.message === 'bad_tick')         return res.status(400).json({ error: 'bad_tick' });
+    logErr('API+/bucket/orders-range', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+app.get('/bucket/stops-range', async (req, res) => {
+  try {
+    const { asset, fromId, toId } = await resolveBucketRange(req.query);
+
+    const side = parseSideFilter(req.query);
+    const sort = parseSort(req.query);
+    const ord  = parseOrder(req.query);
+    const group = String(req.query.group || '').trim() === '1';
+
+    let qp = `stop_buckets?asset_id=eq.${asset}&bucket_id=gte.${fromId}&bucket_id=lte.${toId}` +
+             `&select=bucket_id,position_id,stop_type,lots,side&order=bucket_id.asc,${sort}.${ord}`;
+    if (side !== null) qp += `&side=eq.${side}`;
+
+    const rows = await get(qp) || [];
+    const label = (t) => (t === 1 ? 'SL' : t === 2 ? 'TP' : t === 3 ? 'LIQ' : 'UNK');
+
+    if (!group) {
+      return ok(res, {
+        asset,
+        bucket_from: fromId,
+        bucket_to: toId,
+        count: rows.length,
+        items: rows.map(r => ({
+          bucket_id: String(r.bucket_id),
+          id: r.position_id,
+          type: label(r.stop_type),
+          lots: r.lots ?? 0,
+          side: r.side === true ? 'LONG' : 'SHORT'
+        }))
+      });
+    }
+
+    const byBucket = new Map();
+    for (const r of rows) {
+      const b = String(r.bucket_id);
+      if (!byBucket.has(b)) byBucket.set(b, []);
+      byBucket.get(b).push({
+        id: r.position_id,
+        type: label(r.stop_type),
+        lots: r.lots ?? 0,
+        side: r.side === true ? 'LONG' : 'SHORT'
+      });
+    }
+    const buckets = Array.from(byBucket.entries()).map(([bucket_id, items]) => ({ bucket_id, items }));
+
+    ok(res, {
+      asset,
+      bucket_from: fromId,
+      bucket_to: toId,
+      bucket_count: buckets.length,
+      item_count: rows.length,
+      buckets
+    });
+  } catch (e) {
+    if (e?.message === 'asset_required')   return res.status(400).json({ error: 'asset_required' });
+    if (e?.message === 'range_required')   return res.status(400).json({ error: 'range_required' });
+    if (e?.message === 'asset_not_found')  return res.status(404).json({ error: 'asset_not_found' });
+    if (e?.message === 'bad_tick')         return res.status(400).json({ error: 'bad_tick' });
+    logErr('API+/bucket/stops-range', e);
     res.status(500).json({ error: 'internal_error' });
   }
 });
@@ -253,7 +441,6 @@ app.get('/exposure/:assetId', async (req, res) => {
     if (!Number.isInteger(assetId)) return bad(res, 'asset_id_invalid');
 
     const rows = await get(`exposure_metrics?asset_id=eq.${assetId}&select=asset_id,side_label,sum_lots,avg_entry_x6,avg_leverage_x,avg_liq_x6,positions_count`);
-    // format “joli” groupé long/short
     const out = { asset_id: assetId, long: null, short: null };
     for (const r of (rows || [])) {
       const obj = {
