@@ -461,6 +461,132 @@ app.get('/exposure/:assetId', async (req, res) => {
 });
 
 /* -------------------------------
+   Bucket RANGE (orders + stops, one-shot)
+   Endpoint: /bucket/range
+   Params:
+     - asset (required)
+     - from, to  (prix décimal OU bucket_id entier) — inclusif
+     - side=long|short|all   (def: all)
+     - sort=lots|id          (def: lots) — appliqué aux deux
+     - order=asc|desc        (def: desc)
+     - group=1               (regroupe par bucket_id)
+     - types=orders,stops    (optionnel; def: les deux)
+-------------------------------- */
+app.get('/bucket/range', async (req, res) => {
+  try {
+    const { asset, fromId, toId } = await resolveBucketRange(req.query);
+
+    const side  = parseSideFilter(req.query);
+    const sort  = parseSort(req.query);
+    const ord   = parseOrder(req.query);
+    const group = String(req.query.group || '').trim() === '1';
+
+    // allow filtering what to fetch, default both
+    const typesRaw = String(req.query.types || 'orders,stops').toLowerCase();
+    const wantOrders = /orders/.test(typesRaw);
+    const wantStops  = /stops/.test(typesRaw);
+
+    // Build queries
+    const queries = [];
+    if (wantOrders) {
+      let qp = `order_buckets?asset_id=eq.${asset}&bucket_id=gte.${fromId}&bucket_id=lte.${toId}` +
+               `&select=bucket_id,position_id,lots,side&order=bucket_id.asc,${sort}.${ord}`;
+      if (side !== null) qp += `&side=eq.${side}`;
+      queries.push(get(qp));
+    } else {
+      queries.push(Promise.resolve(null));
+    }
+
+    if (wantStops) {
+      let qp = `stop_buckets?asset_id=eq.${asset}&bucket_id=gte.${fromId}&bucket_id=lte.${toId}` +
+               `&select=bucket_id,position_id,stop_type,lots,side&order=bucket_id.asc,${sort}.${ord}`;
+      if (side !== null) qp += `&side=eq.${side}`;
+      queries.push(get(qp));
+    } else {
+      queries.push(Promise.resolve(null));
+    }
+
+    const [ordersRowsRaw, stopsRowsRaw] = await Promise.all(queries);
+    const ordersRows = ordersRowsRaw || [];
+    const stopsRows  = stopsRowsRaw  || [];
+
+    const mapSide = (b) => (b === true ? 'LONG' : 'SHORT');
+    const mapType = (t) => (t === 1 ? 'SL' : t === 2 ? 'TP' : t === 3 ? 'LIQ' : 'UNK');
+
+    if (!group) {
+      return ok(res, {
+        asset,
+        bucket_from: fromId,
+        bucket_to: toId,
+        count_orders: ordersRows.length,
+        count_stops:  stopsRows.length,
+        items_orders: ordersRows.map(r => ({
+          bucket_id: String(r.bucket_id),
+          id: r.position_id,
+          lots: r.lots ?? 0,
+          side: mapSide(r.side)
+        })),
+        items_stops: stopsRows.map(r => ({
+          bucket_id: String(r.bucket_id),
+          id: r.position_id,
+          type: mapType(r.stop_type),
+          lots: r.lots ?? 0,
+          side: mapSide(r.side)
+        }))
+      });
+    }
+
+    // group=1 → group both sections by bucket_id
+    const groupByBucket = (rows, mapper) => {
+      const m = new Map();
+      for (const r of rows) {
+        const b = String(r.bucket_id);
+        if (!m.has(b)) m.set(b, []);
+        m.get(b).push(mapper(r));
+      }
+      return Array.from(m.entries()).map(([bucket_id, items]) => ({ bucket_id, items }));
+    };
+
+    const ordersBuckets = groupByBucket(ordersRows, (r) => ({
+      id: r.position_id,
+      lots: r.lots ?? 0,
+      side: mapSide(r.side)
+    }));
+
+    const stopsBuckets = groupByBucket(stopsRows, (r) => ({
+      id: r.position_id,
+      type: mapType(r.stop_type),
+      lots: r.lots ?? 0,
+      side: mapSide(r.side)
+    }));
+
+    ok(res, {
+      asset,
+      bucket_from: fromId,
+      bucket_to: toId,
+      orders: {
+        bucket_count: ordersBuckets.length,
+        item_count: ordersRows.length,
+        buckets: ordersBuckets
+      },
+      stops: {
+        bucket_count: stopsBuckets.length,
+        item_count: stopsRows.length,
+        buckets: stopsBuckets
+      }
+    });
+  } catch (e) {
+    if (e?.message === 'asset_required')  return res.status(400).json({ error: 'asset_required' });
+    if (e?.message === 'range_required')  return res.status(400).json({ error: 'range_required' });
+    if (e?.message === 'asset_not_found') return res.status(404).json({ error: 'asset_not_found' });
+    if (e?.message === 'bad_tick')        return res.status(400).json({ error: 'bad_tick' });
+    logErr('API+/bucket/range', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+
+/* -------------------------------
    404 fallback
 -------------------------------- */
 app.use((_req, res) => res.status(404).json({ error: 'not_found' }));
