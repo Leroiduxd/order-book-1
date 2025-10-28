@@ -234,4 +234,158 @@ curl -s https://api.brokex.trade/exposure/0
   * `bucket_id = floor(price_x6 / tick_size_usd6)` depuis `assets.tick_size_usd6`.
 * **Sides** : `true` → `LONG`, `false` → `SHORT`, `null` = *all* (pas de filtre).
 * **Tri** : `sort=lots|id`, `order=desc|asc` (défauts `lots/desc`).
+* 
+
+---
+
+## Buckets — plage de prix / buckets
+
+Deux endpoints symétriques sur un **intervalle** de prix (décimal) **ou** de bucket_id (entier) :
+
+* `GET /bucket/orders-range` (table `order_buckets`)
+* `GET /bucket/stops-range`  (table `stop_buckets`)
+
+### Paramètres (query)
+
+* `asset` **(number, requis)** : `asset_id`
+* `from` **(requis)** :
+
+  * **prix** (ex. `116065.34`) **ou**
+  * **bucket_id** (ex. `10917030`)
+* `to` **(requis)** : même logique que `from`
+* `side` *(optionnel)* : `long` | `short` | `all` (défaut `all`)
+* `sort` *(optionnel)* : `lots` | `id` (défaut `lots`)
+* `order` *(optionnel)* : `desc` | `asc` (défaut `desc`)
+* `group` *(optionnel)* : `1` pour **grouper par `bucket_id`** (par défaut, liste “flat”)
+
+> ✅ Si `from`/`to` sont des **prix**, le serveur calcule `bucket_id = floor(price_x6 / tick_size_usd6)`.
+> ✅ L’intervalle est **inclusif** (`gte from`, `lte to`).
+> ✅ Si `from > to`, l’API **inverse** automatiquement la plage.
+
+---
+
+### A) Orders — range
+
+#### `GET /bucket/orders-range?asset=…&from=…&to=…`
+
+**200 (liste “flat”)**
+
+```json
+{
+  "asset": 0,
+  "bucket_from": "10917030",
+  "bucket_to": "10917100",
+  "count": 3,
+  "items": [
+    { "bucket_id": "10917030", "id": 1234, "lots": 5, "side": "LONG" },
+    { "bucket_id": "10917031", "id": 1235, "lots": 2, "side": "SHORT" },
+    { "bucket_id": "10917100", "id": 1236, "lots": 1, "side": "LONG" }
+  ]
+}
+```
+
+**200 (groupé, `&group=1`)**
+
+```json
+{
+  "asset": 0,
+  "bucket_from": "10917030",
+  "bucket_to": "10917100",
+  "bucket_count": 2,
+  "item_count": 3,
+  "buckets": [
+    {
+      "bucket_id": "10917030",
+      "items": [{ "id": 1234, "lots": 5, "side": "LONG" }]
+    },
+    {
+      "bucket_id": "10917100",
+      "items": [
+        { "id": 1235, "lots": 2, "side": "SHORT" },
+        { "id": 1236, "lots": 1, "side": "LONG" }
+      ]
+    }
+  ]
+}
+```
+
+**Exemples**
+
+```bash
+# Par PRIX
+curl -s "https://api.brokex.trade/bucket/orders-range?asset=0&from=116065.34&to=116095.34"
+
+# Par BUCKETS
+curl -s "https://api.brokex.trade/bucket/orders-range?asset=0&from=10917030&to=10917100&side=long&group=1"
+```
+
+---
+
+### B) Stops (SL / TP / LIQ) — range
+
+#### `GET /bucket/stops-range?asset=…&from=…&to=…`
+
+**200 (liste “flat”)**
+
+```json
+{
+  "asset": 0,
+  "bucket_from": "10917030",
+  "bucket_to": "10917100",
+  "count": 2,
+  "items": [
+    { "bucket_id": "10917030", "id": 2001, "type": "SL",  "lots": 2, "side": "LONG" },
+    { "bucket_id": "10917100", "id": 2002, "type": "TP",  "lots": 1, "side": "SHORT" }
+  ]
+}
+```
+
+> `type` vient de `stop_type` : `1=SL`, `2=TP`, `3=LIQ`, sinon `UNK`.
+
+**Exemples**
+
+```bash
+# Par PRIX
+curl -s "https://api.brokex.trade/bucket/stops-range?asset=0&from=116065.34&to=116095.34&sort=id&order=asc"
+
+# Par BUCKETS
+curl -s "https://api.brokex.trade/bucket/stops-range?asset=0&from=10917030&to=10917100&group=1"
+```
+
+---
+
+## Buckets — requête UNIFORME (rappel)
+
+Les endpoints **simples** restent symétriques et acceptent **prix** *ou* **bucket** :
+
+* `GET /bucket/orders?asset=…&price=…` **ou** `&bucket=…`
+* `GET /bucket/stops?asset=…&price=…`  **ou** `&bucket=…`
+
+*(Alias optionnel pris en charge : `q=…` — si décimal ⇒ prix, sinon ⇒ bucket.)*
+
+**Exemples**
+
+```bash
+# Prix
+curl -s "https://api.brokex.trade/bucket/orders?asset=0&price=109170.30"
+
+# Bucket
+curl -s "https://api.brokex.trade/bucket/stops?asset=0&bucket=10917030"
+
+# Alias auto (prix ou bucket)
+curl -s "https://api.brokex.trade/bucket/orders?asset=0&q=109170.30"
+```
+
+---
+
+## Erreurs spécifiques (range)
+
+* `400` : `{ "error": "range_required" }` (si `from`/`to` manquants)
+* `400` : `{ "error": "asset_required" }`
+* `404` : `{ "error": "asset_not_found" }`
+* `400` : `{ "error": "bad_tick" }` (tick non valide pour conversion prix→bucket)
+* `500` : `{ "error": "internal_error" }`
+
+---
+
 
