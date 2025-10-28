@@ -388,4 +388,133 @@ curl -s "https://api.brokex.trade/bucket/orders?asset=0&q=109170.30"
 
 ---
 
+## Buckets — ordres **et** stops combinés
+
+Endpoint unique pour récupérer **tous les ordres et stops** sur une plage de prix ou de buckets.
+Fusionne les fonctionnalités de `/bucket/orders-range` et `/bucket/stops-range`.
+
+### `GET /bucket/range`
+
+Récupère simultanément :
+
+* les ordres (`order_buckets`)
+* les stops (`stop_buckets`, incluant SL / TP / LIQ)
+
+---
+
+### Paramètres (query)
+
+| Paramètre | Type   | Requis | Description                                                      |
+| --------- | ------ | ------ | ---------------------------------------------------------------- |
+| `asset`   | number | ✅      | `asset_id`                                                       |
+| `from`    | string | ✅      | Début d’intervalle (prix décimal ou bucket_id)                   |
+| `to`      | string | ✅      | Fin d’intervalle (prix décimal ou bucket_id)                     |
+| `side`    | string | ❌      | `long` / `short` / `all` *(def. `all`)*                          |
+| `sort`    | string | ❌      | `lots` / `id` *(def. `lots`)*                                    |
+| `order`   | string | ❌      | `asc` / `desc` *(def. `desc`)*                                   |
+| `group`   | number | ❌      | `1` = regroupe par `bucket_id`, sinon liste “flat”               |
+| `types`   | string | ❌      | Filtrage : `orders`, `stops` ou `orders,stops` *(def. les deux)* |
+
+> ⚙️ Le serveur convertit automatiquement les prix décimaux en bucket_ids (`bucket_id = floor(price_x6 / tick_size_usd6)`).
+>
+> ⚙️ Si `from > to`, l’ordre est automatiquement inversé.
+> ⚙️ Les bornes sont inclusives (`gte from`, `lte to`).
+
+---
+
+### Réponse — mode “flat” (par défaut)
+
+**200 OK**
+
+```json
+{
+  "asset": 0,
+  "bucket_from": "10917030",
+  "bucket_to": "10917100",
+  "count_orders": 3,
+  "count_stops": 2,
+  "items_orders": [
+    { "bucket_id": "10917030", "id": 1234, "lots": 5, "side": "LONG" },
+    { "bucket_id": "10917100", "id": 1235, "lots": 2, "side": "SHORT" }
+  ],
+  "items_stops": [
+    { "bucket_id": "10917031", "id": 2001, "type": "SL",  "lots": 1, "side": "LONG" },
+    { "bucket_id": "10917100", "id": 2002, "type": "TP",  "lots": 3, "side": "SHORT" }
+  ]
+}
+```
+
+---
+
+### Réponse — mode “groupé” (`&group=1`)
+
+```json
+{
+  "asset": 0,
+  "bucket_from": "10917030",
+  "bucket_to": "10917100",
+  "orders": {
+    "bucket_count": 2,
+    "item_count": 3,
+    "buckets": [
+      {
+        "bucket_id": "10917030",
+        "items": [{ "id": 1234, "lots": 5, "side": "LONG" }]
+      },
+      {
+        "bucket_id": "10917100",
+        "items": [
+          { "id": 1235, "lots": 2, "side": "SHORT" },
+          { "id": 1236, "lots": 1, "side": "LONG" }
+        ]
+      }
+    ]
+  },
+  "stops": {
+    "bucket_count": 1,
+    "item_count": 2,
+    "buckets": [
+      {
+        "bucket_id": "10917100",
+        "items": [
+          { "id": 2001, "type": "SL", "lots": 1, "side": "LONG" },
+          { "id": 2002, "type": "TP", "lots": 3, "side": "SHORT" }
+        ]
+      }
+    ]
+  }
+}
+```
+
+---
+
+### Exemples
+
+```bash
+# Tous les ordres et stops entre deux PRIX
+curl -s "https://api.brokex.trade/bucket/range?asset=0&from=116065.34&to=116095.34"
+
+# Sur un intervalle de BUCKETS précis, groupé
+curl -s "https://api.brokex.trade/bucket/range?asset=0&from=10917030&to=10917100&group=1"
+
+# Uniquement les ORDERS
+curl -s "https://api.brokex.trade/bucket/range?asset=0&from=10917030&to=10917100&types=orders"
+
+# Uniquement les STOPS, côté SHORT, triés par id ascendant
+curl -s "https://api.brokex.trade/bucket/range?asset=0&from=116065.34&to=116095.34&types=stops&side=short&sort=id&order=asc"
+```
+
+---
+
+### Erreurs possibles
+
+| Code  | Message           | Description                            |
+| ----- | ----------------- | -------------------------------------- |
+| `400` | `asset_required`  | Paramètre `asset` manquant ou invalide |
+| `400` | `range_required`  | `from` ou `to` manquant                |
+| `404` | `asset_not_found` | Asset inexistant                       |
+| `400` | `bad_tick`        | Tick_size_usd6 invalide (0 ou < 0)     |
+| `500` | `internal_error`  | Erreur interne                         |
+
+---
 
