@@ -5,6 +5,7 @@ import cors from 'cors';
 
 import { get } from './shared/rest.js';
 import { logInfo, logErr } from './shared/logger.js';
+import { verifyAndSync } from './verify.js';
 
 const app = express();
 app.use(cors());
@@ -581,6 +582,44 @@ app.get('/bucket/range', async (req, res) => {
     if (e?.message === 'asset_not_found') return res.status(404).json({ error: 'asset_not_found' });
     if (e?.message === 'bad_tick')        return res.status(400).json({ error: 'bad_tick' });
     logErr('API+/bucket/range', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+
+/* -------------------------------
+   Verify states vs on-chain
+   GET /verify/:ids
+   Ex: /verify/1000,3000,5000,3487
+-------------------------------- */
+app.get('/verify/:ids', async (req, res) => {
+  try {
+    const raw = String(req.params.ids || '').trim();
+    if (!raw) return bad(res, 'ids_required');
+
+    const ids = Array.from(
+      new Set(
+        raw
+          .split(',')
+          .map(s => s.trim())
+          .filter(Boolean)
+          .map(n => Number(n))
+          .filter(n => Number.isInteger(n) && n >= 0)
+      )
+    ).sort((a,b) => a - b);
+
+    if (!ids.length) return bad(res, 'ids_invalid');
+
+    const result = await verifyAndSync(ids);
+
+    ok(res, {
+      ok: true,
+      checked: result.checked,
+      updated: result.updated,
+      mismatches: result.mismatches
+    });
+  } catch (e) {
+    logErr('API+/verify', e);
     res.status(500).json({ error: 'internal_error' });
   }
 });
