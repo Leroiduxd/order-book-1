@@ -1,3 +1,4 @@
+// src/shared/abi.js
 export const ABI = {
   Opened: [
     {
@@ -19,6 +20,7 @@ export const ABI = {
       "type": "event"
     }
   ],
+
   Executed: [
     {
       "anonymous": false,
@@ -30,6 +32,7 @@ export const ABI = {
       "type": "event"
     }
   ],
+
   StopsUpdated: [
     {
       "anonymous": false,
@@ -42,6 +45,7 @@ export const ABI = {
       "type": "event"
     }
   ],
+
   Removed: [
     {
       "anonymous": false,
@@ -54,7 +58,9 @@ export const ABI = {
       "name": "Removed",
       "type": "event"
     }
-  ]
+  ],
+
+  // ⚠️ AJOUT ABI lecture de stateOf (attention à la virgule avant cette clé)
   State: [
     'function stateOf(uint32 id) view returns (uint8)'
   ]
