@@ -55,5 +55,8 @@ export const ABI = {
       "type": "event"
     }
   ]
+  State: [
+    'function stateOf(uint32 id) view returns (uint8)'
+  ]
 };
 
