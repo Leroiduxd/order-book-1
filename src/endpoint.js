@@ -637,6 +637,99 @@ app.listen(PORT, '0.0.0.0', () => {
   logInfo('BROKEX', `[API+] listening on http://0.0.0.0:${PORT}`);
 });
 
+/* -------------------------------
+   Find positions by threshold
+   GET /find/targets
+   Params (query):
+     - asset (required)              → asset id (number)
+     - type  (required)              → one of: order | sl | tp | liq
+     - side                          → long | short | all (default: all)
+     - op                            → lte | gte (aliases: <=, >=, below/above, inf/sup, le/ge)
+     - price or bucket or q          → threshold (decimal price like "200.00" OR raw bucket id)
+   Returns: { asset, type, side, op, threshold:{bucket_id, price_x6?}, count, ids[] }
+-------------------------------- */
+app.get('/find/targets', async (req, res) => {
+  try {
+    // ---- helpers (local to the route) ----
+    const parseTargetType = (raw) => {
+      const s = String(raw || '').toLowerCase();
+      if (s === 'order') return { table: 'order_buckets', stopType: null };
+      if (s === 'sl')    return { table: 'stop_buckets',  stopType: 1 };
+      if (s === 'tp')    return { table: 'stop_buckets',  stopType: 2 };
+      if (s === 'liq' || s === 'liquidation') return { table: 'stop_buckets', stopType: 3 };
+      throw Object.assign(new Error('type_invalid'), { http: 400 });
+    };
+
+    const parseOp = (raw) => {
+      const s = String(raw || '').toLowerCase();
+      if (['lte','<=','le','below','inf','inferior'].includes(s)) return 'lte';
+      if (['gte','>=','ge','above','sup','superior'].includes(s)) return 'gte';
+      throw Object.assign(new Error('op_invalid'), { http: 400 });
+    };
+
+    const resolveThresholdBucket = async (asset, valRaw) => {
+      const v = String(valRaw || '').trim();
+      if (!v) throw Object.assign(new Error('threshold_required'), { http: 400 });
+      if (isPriceLike(v)) {
+        const px6 = priceStrToX6(v);
+        const bucketId = await computeBucketId(asset, px6);
+        return { bucketId: String(bucketId), priceX6: px6.toString() };
+      }
+      // raw bucket id
+      return { bucketId: String(v), priceX6: null };
+    };
+
+    // ---- parse inputs ----
+    const asset = Number(req.query.asset);
+    if (!Number.isInteger(asset)) throw Object.assign(new Error('asset_required'), { http: 400 });
+
+    const { table, stopType } = parseTargetType(req.query.type);
+    const op = parseOp(req.query.op);
+
+    const sideFilter = parseSideFilter(req.query); // reuses your helper: long|short|null
+    const thr = await resolveThresholdBucket(asset, req.query.price ?? req.query.bucket ?? req.query.q);
+
+    // ---- build PostgREST query ----
+    // comparator on bucket_id
+    const cmp = op === 'lte' ? 'lte' : 'gte';
+    let qp = `${table}?asset_id=eq.${asset}&bucket_id=${cmp}.${thr.bucketId}&select=position_id,side`;
+
+    if (table === 'stop_buckets' && stopType != null) {
+      qp += `&stop_type=eq.${stopType}`;
+    }
+    if (sideFilter !== null) {
+      qp += `&side=eq.${sideFilter}`; // true (long) / false (short)
+    }
+
+    // keep results stable
+    qp += `&order=bucket_id.asc,position_id.asc`;
+
+    const rows = await get(qp) || [];
+    // dedupe ids just in case
+    const ids = Array.from(new Set(rows.map(r => Number(r.position_id)).filter(n => Number.isInteger(n)))).sort((a,b)=>a-b);
+
+    ok(res, {
+      asset,
+      type: String(req.query.type).toLowerCase(),
+      side: sideFilter === null ? 'all' : (sideFilter ? 'long' : 'short'),
+      op,
+      threshold: { bucket_id: thr.bucketId, price_x6: thr.priceX6 },
+      count: ids.length,
+      ids
+    });
+  } catch (e) {
+    if (e?.message === 'asset_required')        return res.status(400).json({ error: 'asset_required' });
+    if (e?.message === 'type_invalid')          return res.status(400).json({ error: 'type_invalid' });
+    if (e?.message === 'op_invalid')            return res.status(400).json({ error: 'op_invalid' });
+    if (e?.message === 'threshold_required')    return res.status(400).json({ error: 'threshold_required' });
+    if (e?.message === 'asset_not_found')       return res.status(404).json({ error: 'asset_not_found' });
+    if (e?.message === 'bad_tick')              return res.status(400).json({ error: 'bad_tick' });
+    logErr('API+/find/targets', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+
 // guards
 process.on('unhandledRejection', (err) => logErr('API+','unhandledRejection', err));
 process.on('uncaughtException', (err) => logErr('API+','uncaughtException', err));
