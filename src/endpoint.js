@@ -588,56 +588,6 @@ app.get('/bucket/range', async (req, res) => {
 
 
 /* -------------------------------
-   Verify states vs on-chain
-   GET /verify/:ids
-   Ex: /verify/1000,3000,5000,3487
--------------------------------- */
-app.get('/verify/:ids', async (req, res) => {
-  try {
-    const raw = String(req.params.ids || '').trim();
-    if (!raw) return bad(res, 'ids_required');
-
-    const ids = Array.from(
-      new Set(
-        raw
-          .split(',')
-          .map(s => s.trim())
-          .filter(Boolean)
-          .map(n => Number(n))
-          .filter(n => Number.isInteger(n) && n >= 0)
-      )
-    ).sort((a,b) => a - b);
-
-    if (!ids.length) return bad(res, 'ids_invalid');
-
-    const result = await verifyAndSync(ids);
-
-    ok(res, {
-      ok: true,
-      checked: result.checked,
-      updated: result.updated,
-      mismatches: result.mismatches
-    });
-  } catch (e) {
-    logErr('API+/verify', e);
-    res.status(500).json({ error: 'internal_error' });
-  }
-});
-
-
-/* -------------------------------
-   404 fallback
--------------------------------- */
-app.use((_req, res) => res.status(404).json({ error: 'not_found' }));
-
-/* -------------------------------
-   Start
--------------------------------- */
-app.listen(PORT, '0.0.0.0', () => {
-  logInfo('BROKEX', `[API+] listening on http://0.0.0.0:${PORT}`);
-});
-
-/* -------------------------------
    Find positions by threshold
    GET /find/targets
    Params (query):
@@ -734,3 +684,55 @@ app.get('/find/targets', async (req, res) => {
 process.on('unhandledRejection', (err) => logErr('API+','unhandledRejection', err));
 process.on('uncaughtException', (err) => logErr('API+','uncaughtException', err));
 
+
+
+
+/* -------------------------------
+   Verify states vs on-chain
+   GET /verify/:ids
+   Ex: /verify/1000,3000,5000,3487
+-------------------------------- */
+app.get('/verify/:ids', async (req, res) => {
+  try {
+    const raw = String(req.params.ids || '').trim();
+    if (!raw) return bad(res, 'ids_required');
+
+    const ids = Array.from(
+      new Set(
+        raw
+          .split(',')
+          .map(s => s.trim())
+          .filter(Boolean)
+          .map(n => Number(n))
+          .filter(n => Number.isInteger(n) && n >= 0)
+      )
+    ).sort((a,b) => a - b);
+
+    if (!ids.length) return bad(res, 'ids_invalid');
+
+    const result = await verifyAndSync(ids);
+
+    ok(res, {
+      ok: true,
+      checked: result.checked,
+      updated: result.updated,
+      mismatches: result.mismatches
+    });
+  } catch (e) {
+    logErr('API+/verify', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+
+/* -------------------------------
+   404 fallback
+-------------------------------- */
+app.use((_req, res) => res.status(404).json({ error: 'not_found' }));
+
+/* -------------------------------
+   Start
+-------------------------------- */
+app.listen(PORT, '0.0.0.0', () => {
+  logInfo('BROKEX', `[API+] listening on http://0.0.0.0:${PORT}`);
+});
