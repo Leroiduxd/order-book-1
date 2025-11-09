@@ -60,8 +60,11 @@ export const ABI = {
     }
   ],
 
-  // ⚠️ AJOUT ABI lecture de stateOf (attention à la virgule avant cette clé)
-  State: [
+  // 🔎 Lecture on-chain
+  Read: [
+    // getTrade(uint32)
+    'function getTrade(uint32 id) view returns (address owner,uint32 asset,uint16 lots,uint8 flags,uint8 _pad0,int64 entryX6,int64 targetX6,int64 slX6,int64 tpX6,int64 liqX6,uint16 leverageX,uint16 _pad1,uint64 marginUsd6)',
+    // stateOf(uint32)
     'function stateOf(uint32 id) view returns (uint8)'
   ]
 };
