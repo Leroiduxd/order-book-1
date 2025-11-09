@@ -10,10 +10,10 @@ import { get, postArray, patch, del } from './shared/rest.js';
 import { upsertOpenedEvent } from './shared/db.js';
 
 const CONTRACT_ADDRESS = (process.env.CONTRACT_ADDR || '').trim();
-const RPC_URL          = (process.env.RPC_HTTP   || '').trim();
+const RPC_URL = process.env.RPC_URL || process.env.RPC_HTTP;
 
 if (!CONTRACT_ADDRESS) throw new Error('CONTRACT_ADDR manquant dans .env');
-if (!RPC_URL)          throw new Error('RPC_HTTP manquant dans .env');
+if (!RPC_URL) throw new Error('RPC_URL manquant dans .env');
 
 const TAG = 'Manual';
 
