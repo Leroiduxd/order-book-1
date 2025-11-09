@@ -508,4 +508,10 @@ end$$;
 
 -- (Vue: pas besoin de policy, elle hérite des droits sous-jacents)
 
+ALTER TABLE public.positions
+  DROP CONSTRAINT IF EXISTS positions_state_check;
+
+ALTER TABLE public.positions
+  ADD CONSTRAINT positions_state_check CHECK (state IN (0,1,2,3));
+
 
