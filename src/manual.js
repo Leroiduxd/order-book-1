@@ -1,32 +1,18 @@
-// src/manual.js — backfill local "comme opened.js" (sans API HTTP)
+// src/manual.js — backfill avec stateOf + indexation ORDER/SL/TP/LIQ
 // Usage: node src/manual.js --end=<uint32_last_id> [--count=100]
-
 import 'dotenv/config';
 import { ethers } from 'ethers';
 import { setTimeout as sleep } from 'node:timers/promises';
 
-// ✅ on importe les mêmes helpers que opened.js
+// On réutilise exactement la même voie DB qu'opened.js
 import { upsertOpenedEvent } from './shared/db.js';
 import { logInfo, logErr } from './shared/logger.js';
 
 // =========================
-// CONFIG (import si possible, sinon défauts)
+// CONFIG (auto-contenu: .env sinon fallback)
 // =========================
-let CONTRACT_ADDRESS, RPC_URL;
-try {
-  const cfg = await import(new URL('../config.js', import.meta.url));
-  CONTRACT_ADDRESS = cfg.EXECUTOR_ADDR ?? '0xb449FD01FA7937d146e867b995C261E33C619292';
-  RPC_URL          = cfg.EXECUTOR_RPC  ?? 'https://atlantic.dplabs-internal.com';
-} catch {
-  try {
-    const cfg2 = await import(new URL('./config.js', import.meta.url));
-    CONTRACT_ADDRESS = cfg2.EXECUTOR_ADDR ?? '0xb449FD01FA7937d146e867b995C261E33C619292';
-    RPC_URL          = cfg2.EXECUTOR_RPC  ?? 'https://atlantic.dplabs-internal.com';
-  } catch {
-    CONTRACT_ADDRESS = '0xb449FD01FA7937d146e867b995C261E33C619292';
-    RPC_URL          = 'https://atlantic.dplabs-internal.com';
-  }
-}
+const CONTRACT_ADDRESS = (process.env.CONTRACT_ADDR || '0xb449FD01FA7937d146e867b995C261E33C619292').trim();
+const RPC_URL          = (process.env.RPC_HTTP   || 'https://atlantic.dplabs-internal.com').trim();
 
 // =========================
 // CLI
@@ -38,8 +24,7 @@ const flags = Object.fromEntries(
   })
 );
 const END_ID = Number(flags.end ?? NaN);
-const COUNT  = Math.max(1, Math.min(Number(flags.count ?? 100), 2000)); // borne haute
-
+const COUNT  = Math.max(1, Math.min(Number(flags.count ?? 100), 2000));
 if (!Number.isInteger(END_ID) || END_ID < 0) {
   console.error('Usage: node src/manual.js --end=<uint32 last ID> [--count=100]');
   process.exit(1);
@@ -54,28 +39,36 @@ const PAUSE_BETWEEN_BATCH_MS = 40;
 const TAG = 'ManualBackfill';
 
 // =========================
-// ABI getTrade(uint32) — inline
+// ABI inline: getTrade(uint32), stateOf(uint32)
 // =========================
-const TRADES_ABI = [{
-  "inputs":[{"internalType":"uint32","name":"id","type":"uint32"}],
-  "name":"getTrade",
-  "outputs":[{"components":[
-    {"internalType":"address","name":"owner","type":"address"},
-    {"internalType":"uint32","name":"asset","type":"uint32"},
-    {"internalType":"uint16","name":"lots","type":"uint16"},
-    {"internalType":"uint8","name":"flags","type":"uint8"},
-    {"internalType":"uint8","name":"_pad0","type":"uint8"},
-    {"internalType":"int64","name":"entryX6","type":"int64"},
-    {"internalType":"int64","name":"targetX6","type":"int64"},
-    {"internalType":"int64","name":"slX6","type":"int64"},
-    {"internalType":"int64","name":"tpX6","type":"int64"},
-    {"internalType":"int64","name":"liqX6","type":"int64"},
-    {"internalType":"uint16","name":"leverageX","type":"uint16"},
-    {"internalType":"uint16","name":"_pad1","type":"uint16"},
-    {"internalType":"uint64","name":"marginUsd6","type":"uint64"}],
-    "internalType":"struct Trades.Trade","name":"","type":"tuple"}],
-  "stateMutability":"view","type":"function"
-}];
+const TRADES_ABI = [
+  {
+    "inputs":[{"internalType":"uint32","name":"id","type":"uint32"}],
+    "name":"getTrade",
+    "outputs":[{"components":[
+      {"internalType":"address","name":"owner","type":"address"},
+      {"internalType":"uint32","name":"asset","type":"uint32"},
+      {"internalType":"uint16","name":"lots","type":"uint16"},
+      {"internalType":"uint8","name":"flags","type":"uint8"},
+      {"internalType":"uint8","name":"_pad0","type":"uint8"},
+      {"internalType":"int64","name":"entryX6","type":"int64"},
+      {"internalType":"int64","name":"targetX6","type":"int64"},
+      {"internalType":"int64","name":"slX6","type":"int64"},
+      {"internalType":"int64","name":"tpX6","type":"int64"},
+      {"internalType":"int64","name":"liqX6","type":"int64"},
+      {"internalType":"uint16","name":"leverageX","type":"uint16"},
+      {"internalType":"uint16","name":"_pad1","type":"uint16"},
+      {"internalType":"uint64","name":"marginUsd6","type":"uint64"}],
+      "internalType":"struct Trades.Trade","name":"","type":"tuple"}],
+    "stateMutability":"view","type":"function"
+  },
+  {
+    "inputs":[{"internalType":"uint32","name":"id","type":"uint32"}],
+    "name":"stateOf",
+    "outputs":[{"internalType":"uint8","name":"","type":"uint8"}],
+    "stateMutability":"view","type":"function"
+  }
+];
 
 // =========================
 // Helpers
@@ -107,7 +100,7 @@ async function runWithConcurrency(tasks, max) {
   });
 }
 
-function tradeExistsLikeOpened(t) {
+function tradeLooksValid(t) {
   const owner = (t?.owner || '').toLowerCase();
   try {
     const margin = BigInt(String(t?.marginUsd6 ?? '0'));
@@ -120,7 +113,7 @@ function tradeExistsLikeOpened(t) {
 }
 
 // =========================
-/* MAIN */
+// MAIN
 // =========================
 (async function main() {
   logInfo(TAG, `RPC=${RPC_URL} | CONTRACT=${CONTRACT_ADDRESS}`);
@@ -129,53 +122,53 @@ function tradeExistsLikeOpened(t) {
   const provider = new ethers.JsonRpcProvider(RPC_URL);
   const contract = new ethers.Contract(CONTRACT_ADDRESS, TRADES_ABI, provider);
 
-  // On interroge directement le RPC (pas d’API), et on upsert comme l’event Opened
-  const batches = chunk(IDS, 500);
   let scanned = 0, ingested = 0, skipped = 0;
+  const batches = chunk(IDS, 500);
 
   for (const group of batches) {
     const tasks = group.map((id) => async () => {
       try {
-        const t = await contract.getTrade(id);
-        const tr = {
-          id,
-          owner: String(t.owner),
-          asset: Number(t.asset),
-          lots: Number(t.lots),
-          flags: Number(t.flags),
-          entryX6: String(t.entryX6),
-          targetX6: String(t.targetX6),
-          slX6: String(t.slX6),
-          tpX6: String(t.tpX6),
-          liqX6: String(t.liqX6),
-          leverageX: Number(t.leverageX),
-          marginUsd6: String(t.marginUsd6),
-        };
+        // Récupère trade + état en parallèle
+        const [t, stRaw] = await Promise.all([
+          contract.getTrade(id),
+          contract.stateOf(id).catch(() => 0) // fallback 0 si la fn n'existe pas (ancien build)
+        ]);
         scanned++;
 
-        if (!tradeExistsLikeOpened(tr)) {
+        if (!tradeLooksValid(t)) {
           skipped++;
           return;
         }
+        const state = Number(stRaw) | 0; // 0=ORDER,1=OPENED,2=CLOSED,3=CANCELLED
 
-        // Payload identique à opened.js → upsertOpenedEvent(...)
+        // Règle métier demandée :
+        // - state=0 (ORDER)  -> indexer un ORDER au prix targetX6 (si 0, fallback entryX6)
+        // - state=1 (OPENED) -> indexer SL/TP/LIQ côté antagoniste (!longSide)
+        const isOrder  = state === 0;
+        const isOpen   = state === 1;
+
+        const entryOrTargetX6 = isOrder
+          ? String((t.targetX6 && t.targetX6 !== 0n) ? t.targetX6 : t.entryX6)
+          : String(t.entryX6); // pour OPENED, entry
+
         await upsertOpenedEvent({
           id,
-          state: 1, // 1 = Opened
-          asset: tr.asset,
-          longSide: (tr.flags & 1) === 1, // si flag bit0 = long
-          lots: tr.lots,
-          entryOrTargetX6: tr.entryX6,    // ta sémantique: pour Opened c’est entryX6
-          slX6: tr.slX6,
-          tpX6: tr.tpX6,
-          liqX6: tr.liqX6,
-          trader: tr.owner,
-          leverageX: tr.leverageX,
+          state,
+          asset: Number(t.asset),
+          longSide: (Number(t.flags) & 1) === 1,
+          lots: Number(t.lots),
+          entryOrTargetX6,
+          // Pour ORDER on n’indexe pas les stops; pour OPEN oui (db.js gère l’antagoniste)
+          slX6: isOpen ? String(t.slX6 ?? 0) : '0',
+          tpX6: isOpen ? String(t.tpX6 ?? 0) : '0',
+          liqX6:isOpen ? String(t.liqX6 ?? 0) : '0',
+          trader: String(t.owner),
+          leverageX: Number(t.leverageX)
         });
 
         ingested++;
       } catch (e) {
-        logErr(TAG, `getTrade/upsert id=${id} → ${e?.shortMessage || e?.message || String(e)}`);
+        logErr(TAG, `id=${id} → ${e?.shortMessage || e?.message || String(e)}`);
       }
     });
 
