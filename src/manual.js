@@ -1,51 +1,64 @@
-// src/manual.js
-// ============================================================
-//  Brokex Manual Verify — Vérifie les 100 derniers IDs
-//  API -> RPC fallback -> /verify/<ids>  (auto-index sécu)
-//  ✅ Aucune dépendance externe (pas de config.js requis)
-// ============================================================
-
+// src/manual.js — simple, prend la config si dispo + ABI inline
 import 'dotenv/config';
-import { setTimeout as sleep } from 'node:timers/promises';
 import { ethers } from 'ethers';
+import { setTimeout as sleep } from 'node:timers/promises';
 
-// ============================================================
-// 🔧 CONFIGURATION LOCALE (autonome)
-// ============================================================
-const API_BASE = 'https://api.brokex.trade';
-const VERIFY_BASE = API_BASE;
-const CONTRACT_ADDRESS = '0xb449FD01FA7937d146e867b995C261E33C619292';
-const RPC_URL = 'https://atlantic.dplabs-internal.com';
+/* =========================
+   CONFIG (import si possible)
+========================= */
+let API_BASE, VERIFY_BASE, CONTRACT_ADDRESS, RPC_URL;
 
-// Limites
-const MAX_API_PARALLEL = 200;
-const MAX_RPC_PARALLEL = 50;
-const SLEEP_BETWEEN_PHASE_MS = 300;
+// Essaie ../config.js (repo classique: config à la racine)
+try {
+  const cfg = await import(new URL('../config.js', import.meta.url));
+  API_BASE         = cfg.API_BASE ?? 'https://api.brokex.trade';
+  VERIFY_BASE      = cfg.VERIFY_BASE ?? API_BASE;
+  CONTRACT_ADDRESS = cfg.EXECUTOR_ADDR ?? '0xb449FD01FA7937d146e867b995C261E33C619292';
+  RPC_URL          = cfg.EXECUTOR_RPC ?? 'https://atlantic.dplabs-internal.com';
+} catch {
+  // Essaie ./config.js (au cas où)
+  try {
+    const cfg2 = await import(new URL('./config.js', import.meta.url));
+    API_BASE         = cfg2.API_BASE ?? 'https://api.brokex.trade';
+    VERIFY_BASE      = cfg2.VERIFY_BASE ?? API_BASE;
+    CONTRACT_ADDRESS = cfg2.EXECUTOR_ADDR ?? '0xb449FD01FA7937d146e867b995C261E33C619292';
+    RPC_URL          = cfg2.EXECUTOR_RPC ?? 'https://atlantic.dplabs-internal.com';
+  } catch {
+    // Defaults si pas de config trouvée
+    API_BASE         = 'https://api.brokex.trade';
+    VERIFY_BASE      = API_BASE;
+    CONTRACT_ADDRESS = '0xb449FD01FA7937d146e867b995C261E33C619292';
+    RPC_URL          = 'https://atlantic.dplabs-internal.com';
+  }
+}
 
-// ============================================================
-// 🔢 CLI ARGUMENTS
-// ============================================================
-const flags = Object.fromEntries(process.argv.slice(2).map(a => {
-  const [k, v = 'true'] = a.startsWith('--') ? a.slice(2).split('=') : [a, 'true'];
-  return [k, v];
-}));
-
+/* =========================
+   CLI
+========================= */
+const flags = Object.fromEntries(
+  process.argv.slice(2).map(a => {
+    const [k, v = 'true'] = a.startsWith('--') ? a.slice(2).split('=') : [a, 'true'];
+    return [k, v];
+  })
+);
 const END_ID = Number(flags.end ?? NaN);
-const COUNT  = Math.max(1, Math.min(Number(flags.count ?? 100), 500));
-
+const COUNT  = Math.max(1, Math.min(Number(flags.count ?? 100), 1000)); // borne haute
 if (!Number.isInteger(END_ID) || END_ID < 0) {
   console.error('Usage: node src/manual.js --end=<uint32 last ID> [--count=100]');
   process.exit(1);
 }
-
 const START_ID = Math.max(0, END_ID - COUNT + 1);
 const IDS = Array.from({ length: END_ID - START_ID + 1 }, (_, i) => START_ID + i);
 
+const MAX_API_PARALLEL = 200;
+const MAX_RPC_PARALLEL = 50;
+const PAUSE_BETWEEN_PHASES_MS = 200;
+
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
-// ============================================================
-// ⚙️ ABI getTrade(uint32)
-// ============================================================
+/* =========================
+   ABI INLINE: getTrade(uint32)
+========================= */
 const TRADES_ABI = [{
   "inputs":[{"internalType":"uint32","name":"id","type":"uint32"}],
   "name":"getTrade",
@@ -67,15 +80,9 @@ const TRADES_ABI = [{
   "stateMutability":"view","type":"function"
 }];
 
-// ============================================================
-// 🧩 HELPERS
-// ============================================================
-function chunk(arr, n) {
-  const out = [];
-  for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
-  return out;
-}
-
+/* =========================
+   Helpers
+========================= */
 async function runWithConcurrency(tasks, max) {
   const res = new Array(tasks.length);
   let i = 0, running = 0;
@@ -102,21 +109,27 @@ async function fetchAPIPosition(id) {
   const url = `${API_BASE}/position/${id}`;
   try {
     const r = await fetch(url);
-    if (!r.ok) return { id, ok: false, reason: `HTTP ${r.status}` };
+    if (!r.ok) return { id, ok: false };
     const json = await r.json().catch(() => null);
-    if (!json || json?.error === 'position_not_found') return { id, ok: false, reason: json?.error || 'not_found' };
+    if (!json || json?.error === 'position_not_found') return { id, ok: false };
     return { id, ok: true, data: json };
-  } catch (e) {
-    return { id, ok: false, reason: e?.message || String(e) };
+  } catch {
+    return { id, ok: false };
   }
 }
 
-async function getTradeRPC(contract, id) {
+async function getTradeExists(contract, id) {
   try {
     const t = await contract.getTrade(id);
-    return { id, ok: true, trade: t };
-  } catch (e) {
-    return { id, ok: false, reason: e?.shortMessage || e?.message || String(e) };
+    const owner = (t?.owner || '').toLowerCase?.() || '';
+    const exists =
+      (owner && owner !== '0x0000000000000000000000000000000000000000') ||
+      Number(t?.asset || 0) > 0 ||
+      Number(t?.lots || 0) > 0 ||
+      Number(t?.marginUsd6 || 0) > 0;
+    return { id, ok: !!exists };
+  } catch {
+    return { id, ok: false };
   }
 }
 
@@ -126,71 +139,60 @@ function pingVerify(ids) {
   fetch(url).catch(() => {}); // fire-and-forget
 }
 
-// ============================================================
-// 🚀 MAIN
-// ============================================================
+/* =========================
+   MAIN
+========================= */
 (async function main() {
   log(`Manual verify: IDs ${START_ID}..${END_ID} (count=${IDS.length})`);
-  log(`API_BASE=${API_BASE} | VERIFY_BASE=${VERIFY_BASE}`);
-  log(`RPC=${RPC_URL} | CONTRACT=${CONTRACT_ADDRESS}`);
+  log(`API=${API_BASE} | VERIFY=${VERIFY_BASE} | RPC=${RPC_URL} | CONTRACT=${CONTRACT_ADDRESS}`);
 
-  // 1) Phase API
-  log(`Phase API: ${IDS.length} requêtes (≤${MAX_API_PARALLEL} //)…`);
+  // 1) API check
   const apiTasks = IDS.map(id => () => fetchAPIPosition(id));
   const apiRes = await runWithConcurrency(apiTasks, Math.min(MAX_API_PARALLEL, apiTasks.length));
 
-  const apiOk   = [];
+  const apiOk = [];
   const apiMiss = [];
   apiRes.forEach((r, idx) => {
     const id = IDS[idx];
     if (r.ok && r.v?.ok) apiOk.push(id);
     else apiMiss.push(id);
   });
-
   log(`API OK=${apiOk.length} | API MISS=${apiMiss.length}`);
-  await sleep(SLEEP_BETWEEN_PHASE_MS);
 
-  // 2) Phase RPC (fallback)
-  const needRpc = apiMiss;
+  await sleep(PAUSE_BETWEEN_PHASES_MS);
+
+  // 2) RPC fallback pour les manquants
   let rpcOk = [];
-  if (needRpc.length) {
+  if (apiMiss.length) {
     const provider = new ethers.JsonRpcProvider(RPC_URL);
     const contract = new ethers.Contract(CONTRACT_ADDRESS, TRADES_ABI, provider);
 
-    log(`Phase RPC: ${needRpc.length} getTrade() (≤${MAX_RPC_PARALLEL} //)…`);
-    const rpcTasks = needRpc.map(id => () => getTradeRPC(contract, id));
+    const rpcTasks = apiMiss.map(id => () => getTradeExists(contract, id));
     const rpcRes = await runWithConcurrency(rpcTasks, Math.min(MAX_RPC_PARALLEL, rpcTasks.length));
 
     for (let i = 0; i < rpcRes.length; i++) {
-      const id = needRpc[i];
+      const id = apiMiss[i];
       const r = rpcRes[i];
-      if (r.ok && r.v?.ok) {
-        const t = r.v.trade;
-        const owner = (t?.owner || '').toLowerCase?.() || '';
-        const exists =
-          (owner && owner !== '0x0000000000000000000000000000000000000000') ||
-          Number(t?.asset || 0) > 0 ||
-          Number(t?.lots || 0) > 0 ||
-          Number(t?.marginUsd6 || 0) > 0;
-        if (exists) rpcOk.push(id);
-      }
+      if (r.ok && r.v?.ok) rpcOk.push(id);
     }
-    log(`RPC EXIST=${rpcOk.length}`);
+    log(`RPC PRESENT=${rpcOk.length}`);
   }
 
-  await sleep(SLEEP_BETWEEN_PHASE_MS);
-
-  // 3) VERIFY : push à l’API pour sync ou ajout
-  const toVerify = Array.from(new Set([...rpcOk, ...apiOk])).sort((a,b)=>a-b);
-  log(`VERIFY push: ${toVerify.length} ids → ${VERIFY_BASE}/verify/...`);
-
-  const packets = chunk(toVerify, 200);
-  for (const pack of packets) {
-    pingVerify(pack);
-    await sleep(50);
+  // 3) Envoi à /verify pour indexation/refresh (comme Opened)
+  const toVerify = rpcOk.sort((a, b) => a - b);
+  if (toVerify.length) {
+    log(`VERIFY push: ${toVerify.length} ids → ${VERIFY_BASE}/verify/...`);
+    // petit batch pour éviter de bourriner
+    const size = 200;
+    for (let i = 0; i < toVerify.length; i += size) {
+      pingVerify(toVerify.slice(i, i + size));
+      await sleep(50);
+    }
+  } else {
+    log('Rien à vérifier (déjà indexé côté API ou absent côté RPC).');
   }
 
-  log('✅ Done. Tous les IDs ont été envoyés pour vérification.');
+  log('✅ Terminé.');
 })().catch(e => {
   console.error('❌ Fatal:', e?.message || e);
   process.exit(1);
