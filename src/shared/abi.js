@@ -60,12 +60,29 @@ export const ABI = {
     }
   ],
 
-  // 🔎 Lecture on-chain
-  Read: [
-    // getTrade(uint32)
-    'function getTrade(uint32 id) view returns (address owner,uint32 asset,uint16 lots,uint8 flags,uint8 _pad0,int64 entryX6,int64 targetX6,int64 slX6,int64 tpX6,int64 liqX6,uint16 leverageX,uint16 _pad1,uint64 marginUsd6)',
-    // stateOf(uint32)
-    'function stateOf(uint32 id) view returns (uint8)'
-  ]
+ Getters: [
+    {
+      "inputs":[{"internalType":"uint32","name":"id","type":"uint32"}],
+      "name":"getTrade",
+      "outputs":[{"components":[
+        {"internalType":"address","name":"owner","type":"address"},
+        {"internalType":"uint32","name":"asset","type":"uint32"},
+        {"internalType":"uint16","name":"lots","type":"uint16"},
+        {"internalType":"uint8","name":"flags","type":"uint8"},
+        {"internalType":"uint8","name":"_pad0","type":"uint8"},
+        {"internalType":"int64","name":"entryX6","type":"int64"},
+        {"internalType":"int64","name":"targetX6","type":"int64"},
+        {"internalType":"int64","name":"slX6","type":"int64"},
+        {"internalType":"int64","name":"tpX6","type":"int64"},
+        {"internalType":"int64","name":"liqX6","type":"int64"},
+        {"internalType":"uint16","name":"leverageX","type":"uint16"},
+        {"internalType":"uint16","name":"_pad1","type":"uint16"},
+        {"internalType":"uint64","name":"marginUsd6","type":"uint64"}],
+        "internalType":"struct Trades.Trade","name":"","type":"tuple"}],
+      "stateMutability":"view","type":"function"
+    },
+    // déjà présent chez toi :
+    "function stateOf(uint32 id) view returns (uint8)"
+  ],
 };
 
