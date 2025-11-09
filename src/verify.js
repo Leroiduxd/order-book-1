@@ -260,11 +260,11 @@ export async function backfillIfMultipleOf10(latestId) {
   const id = Number(latestId);
   if (!Number.isInteger(id) || id <= 0) return { scanned: 0, created: 0, skipped: true };
 
-  if (id % 10 !== 0) return { scanned: 0, created: 0, skipped: true };
+  if (id % 100 !== 0) return { scanned: 0, created: 0, skipped: true };
 
-  const from = Math.max(1, id - 9);
+  const from = Math.max(1, id - 99);
   const to   = id;
-  logInfo(TAG, `multiple-of-10 hit: backfilling [${from}..${to}] (up to 500 concurrent RPC calls)`);
+  logInfo(TAG, `multiple-of-100 hit: backfilling [${from}..${to}] (up to 500 concurrent RPC calls)`);
   const res = await backfillRangeIfMissing(from, to, { concurrency: 500 });
   return { ...res, skipped: false };
 }
