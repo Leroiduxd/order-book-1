@@ -1,28 +1,40 @@
-// manual.js
-// Node ESM – exécute un batch "API -> RPC fallback -> VERIFY" sur une plage d'IDs
+// src/manual.js
+// ============================================================
+//  Brokex Manual Verify — Vérifie les 100 derniers IDs
+//  API -> RPC fallback -> /verify/<ids>  (auto-index sécu)
+//  ✅ Aucune dépendance externe (pas de config.js requis)
+// ============================================================
+
 import 'dotenv/config';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { ethers } from 'ethers';
 
-// On réutilise ta config existante (bases, contrat, rpc)
-import { API_BASE, VERIFY_BASE, EXECUTOR_ADDR as CONTRACT_ADDRESS, EXECUTOR_RPC as RPC_URL } from './config.js';
+// ============================================================
+// 🔧 CONFIGURATION LOCALE (autonome)
+// ============================================================
+const API_BASE = 'https://api.brokex.trade';
+const VERIFY_BASE = API_BASE;
+const CONTRACT_ADDRESS = '0xb449FD01FA7937d146e867b995C261E33C619292';
+const RPC_URL = 'https://atlantic.dplabs-internal.com';
 
-// ---------- Options ----------
-const MAX_API_PARALLEL = 200;   // ne pas surcharger l'API
-const MAX_RPC_PARALLEL = 50;    // limiter la pression RPC
-const SLEEP_BETWEEN_PHASE_MS = 300; // micro-pause entre phases
+// Limites
+const MAX_API_PARALLEL = 200;
+const MAX_RPC_PARALLEL = 50;
+const SLEEP_BETWEEN_PHASE_MS = 300;
 
-// CLI: --end=12345 --count=100
+// ============================================================
+// 🔢 CLI ARGUMENTS
+// ============================================================
 const flags = Object.fromEntries(process.argv.slice(2).map(a => {
   const [k, v = 'true'] = a.startsWith('--') ? a.slice(2).split('=') : [a, 'true'];
   return [k, v];
 }));
 
 const END_ID = Number(flags.end ?? NaN);
-const COUNT  = Math.max(1, Math.min( Number(flags.count ?? 100), 500 )); // borne 1..500
+const COUNT  = Math.max(1, Math.min(Number(flags.count ?? 100), 500));
 
 if (!Number.isInteger(END_ID) || END_ID < 0) {
-  console.error('Usage: node manual.js --end=<uint32 last ID> [--count=100]');
+  console.error('Usage: node src/manual.js --end=<uint32 last ID> [--count=100]');
   process.exit(1);
 }
 
@@ -31,7 +43,9 @@ const IDS = Array.from({ length: END_ID - START_ID + 1 }, (_, i) => START_ID + i
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
-// ---------- ABI minimal getTrade(uint32) (inline, comme demandé) ----------
+// ============================================================
+// ⚙️ ABI getTrade(uint32)
+// ============================================================
 const TRADES_ABI = [{
   "inputs":[{"internalType":"uint32","name":"id","type":"uint32"}],
   "name":"getTrade",
@@ -53,7 +67,9 @@ const TRADES_ABI = [{
   "stateMutability":"view","type":"function"
 }];
 
-// ---------- Helpers ----------
+// ============================================================
+// 🧩 HELPERS
+// ============================================================
 function chunk(arr, n) {
   const out = [];
   for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
@@ -107,23 +123,24 @@ async function getTradeRPC(contract, id) {
 function pingVerify(ids) {
   if (!ids?.length) return;
   const url = `${VERIFY_BASE}/verify/${ids.join(',')}`;
-  // fire-and-forget
-  fetch(url).catch(() => {});
+  fetch(url).catch(() => {}); // fire-and-forget
 }
 
-// ---------- Main ----------
+// ============================================================
+// 🚀 MAIN
+// ============================================================
 (async function main() {
   log(`Manual verify: IDs ${START_ID}..${END_ID} (count=${IDS.length})`);
   log(`API_BASE=${API_BASE} | VERIFY_BASE=${VERIFY_BASE}`);
   log(`RPC=${RPC_URL} | CONTRACT=${CONTRACT_ADDRESS}`);
 
-  // 1) Phase API (par chunks, concurrence MAX_API_PARALLEL)
+  // 1) Phase API
   log(`Phase API: ${IDS.length} requêtes (≤${MAX_API_PARALLEL} //)…`);
   const apiTasks = IDS.map(id => () => fetchAPIPosition(id));
   const apiRes = await runWithConcurrency(apiTasks, Math.min(MAX_API_PARALLEL, apiTasks.length));
 
   const apiOk   = [];
-  const apiMiss = []; // à compléter par RPC
+  const apiMiss = [];
   apiRes.forEach((r, idx) => {
     const id = IDS[idx];
     if (r.ok && r.v?.ok) apiOk.push(id);
@@ -133,7 +150,7 @@ function pingVerify(ids) {
   log(`API OK=${apiOk.length} | API MISS=${apiMiss.length}`);
   await sleep(SLEEP_BETWEEN_PHASE_MS);
 
-  // 2) Phase RPC pour les MISS
+  // 2) Phase RPC (fallback)
   const needRpc = apiMiss;
   let rpcOk = [];
   if (needRpc.length) {
@@ -144,7 +161,6 @@ function pingVerify(ids) {
     const rpcTasks = needRpc.map(id => () => getTradeRPC(contract, id));
     const rpcRes = await runWithConcurrency(rpcTasks, Math.min(MAX_RPC_PARALLEL, rpcTasks.length));
 
-    // On retient les IDs "existants" on-chain (owner != 0x0 OU asset/lots/margin non nuls)
     for (let i = 0; i < rpcRes.length; i++) {
       const id = needRpc[i];
       const r = rpcRes[i];
@@ -156,7 +172,6 @@ function pingVerify(ids) {
           Number(t?.asset || 0) > 0 ||
           Number(t?.lots || 0) > 0 ||
           Number(t?.marginUsd6 || 0) > 0;
-
         if (exists) rpcOk.push(id);
       }
     }
@@ -165,21 +180,19 @@ function pingVerify(ids) {
 
   await sleep(SLEEP_BETWEEN_PHASE_MS);
 
-  // 3) VERIFY: on pousse à l’API les IDs manquants/trouvés on-chain + (optionnel) rafraîchir les OK
-  //    - Cas manquant API mais présent on-chain => VERIFY doit indexer/actualiser "comme opened.js"
-  //    - On peut aussi pusher les apiOk pour forcer un refresh d’état (soft).
+  // 3) VERIFY : push à l’API pour sync ou ajout
   const toVerify = Array.from(new Set([...rpcOk, ...apiOk])).sort((a,b)=>a-b);
   log(`VERIFY push: ${toVerify.length} ids → ${VERIFY_BASE}/verify/...`);
 
-  // en morceaux de 200 pour éviter des URLs trop longues
   const packets = chunk(toVerify, 200);
   for (const pack of packets) {
     pingVerify(pack);
-    await sleep(50); // micro-pace
+    await sleep(50);
   }
 
-  log('Done.');
+  log('✅ Done. Tous les IDs ont été envoyés pour vérification.');
 })().catch(e => {
-  console.error('Fatal:', e?.message || e);
+  console.error('❌ Fatal:', e?.message || e);
   process.exit(1);
 });
+
