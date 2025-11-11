@@ -1,11 +1,17 @@
 // ======================================================================
-// BROKEX • manual_state (STATE-ONLY RECONCILE + 0->1 stops indexing)
-// - Appelle UNIQUEMENT stateOf(id) sur la chaîne (PAS de getTrade)
+// BROKEX • manual_state (STATE-ONLY RECONCILE + consistency checks)
+// - Appelle UNIQUEMENT stateOf(id) (PAS de getTrade)
 // - Compare à DB.positions.state
-// - Cas 0->1 : rejoue Executed (entryX6 depuis DB), retire LIMIT et indexe SL/TP si non nuls
-// - Cas 1->2/3 : supprime index SL/TP/LIQ via handleRemovedEvent + met l’état
-// - Cas égaux (0=0, 1=1, 2=2, 3=3) : skip
-// - Autres mismatches : patch state uniquement
+// - Cas 0->1 : Executed + index SL/TP si non nuls
+// - Cas 1->2/3 : handleRemovedEvent (nettoie SL/TP/LIQ/ORDER) + set state 3 si besoin
+// - Cas égaux : vérifie/retape les index (voir détails ci-dessous)
+// - Autres mismatch : patch state uniquement
+//
+// Vérifs supplémentaires quand états égaux :
+//   state=0 : ORDER bien indexé ? sinon upsertOpenedEvent(state:0)
+//   state=1 : pas d'ORDER résiduel ? sinon handleExecutedEvent
+//             SL/TP présents si non nuls ? sinon handleStopsUpdatedEvent
+//   state=2/3 : AUCUN index (ORDER/SL/TP/LIQ) ? sinon handleRemovedEvent
 //
 // Usage CLI:
 //   node src/manual_state.js --end=1200 --count=100
@@ -21,7 +27,8 @@ import { get as pgGet, patch as pgPatch } from './shared/rest.js';
 import {
   handleExecutedEvent,
   handleStopsUpdatedEvent,
-  handleRemovedEvent
+  handleRemovedEvent,
+  upsertOpenedEvent
 } from './shared/db.js';
 
 // ---------- ENV ----------
@@ -60,14 +67,12 @@ function makeCtx({ dbConcurrency = 500, rpcConcurrency = 100 } = {}) {
   const rpcSem = new Semaphore(Number(rpcConcurrency));
   const withDb  = async fn => { const r = await dbSem.acquire();  try { return await fn(); } finally { r(); } };
   const withRpc = async fn => { const r = await rpcSem.acquire(); try { return await fn(); } finally { r(); } };
-  return { withDb, withRpc, dbSem, rpcSem };
+  return { withDb, withRpc };
 }
 
 // ---------- DB helpers ----------
 async function readDbRow(id, withDb) {
   return withDb(async () => {
-    // On lit l’état et les prix/infos utiles déjà stockés côté DB
-    // (on ne lit PAS la chaîne pour ça)
     const sel = 'id,state,sl_x6,tp_x6,liq_x6,target_x6,entry_x6,lots,long_side,asset_id,leverage_x,trader_addr';
     const row = (await pgGet(`positions?id=eq.${id}&select=${sel}&limit=1`))?.[0] || null;
     return row ? {
@@ -89,8 +94,48 @@ async function readDbRow(id, withDb) {
 async function patchDbState(id, state, withDb) {
   return withDb(async () => pgPatch(`positions?id=eq.${id}`, { state }));
 }
+async function readBucketsByPosition(id, withDb) {
+  return withDb(async () => {
+    const [orders, stops] = await Promise.all([
+      pgGet(`order_buckets?position_id=eq.${id}`),
+      pgGet(`stop_buckets?position_id=eq.${id}`)
+    ]);
+    return { orders: orders || [], stops: stops || [] };
+  });
+}
 
-// ---------- Core (STATE-ONLY) ----------
+// ---------- equality helpers ----------
+const BI = (x) => BigInt(x ?? 0);
+
+function orderIndexedEqual(orders, { lots, long_side }) {
+  if ((orders?.length || 0) !== 1) return false;
+  const o = orders[0];
+  return Number(o.lots) === Number(lots) && Boolean(o.side) === Boolean(long_side);
+}
+function stopsIndexedOkForOpen(stops, { sl_x6, tp_x6, liq_x6, lots, long_side }) {
+  const need = [];
+  if (sl_x6 !== 0n)  need.push({ type: 1 });
+  if (tp_x6 !== 0n)  need.push({ type: 2 });
+  if (liq_x6 !== 0n) need.push({ type: 3 }); // présence seulement (création LIQ non gérée ici)
+  const sideShort = !Boolean(long_side);
+
+  // chaque type demandé doit exister avec lots/side attendus
+  for (const w of need) {
+    const m = stops.find(r =>
+      Number(r.stop_type) === w.type &&
+      Number(r.lots) === Number(lots) &&
+      Boolean(r.side) === sideShort
+    );
+    if (!m) return false;
+  }
+  // Si des stops existent alors que correspondants = 0 → on tolère (on ne supprime pas ici sauf state 2/3)
+  return true;
+}
+function hasAnyIndex(orders, stops) {
+  return (orders?.length || 0) > 0 || (stops?.length || 0) > 0;
+}
+
+// ---------- Core (STATE-ONLY + consistency) ----------
 export async function reconcileStateOnly(id, ctx) {
   const { withDb, withRpc } = ctx;
   const out = { id, patched:0, executed:0, stops:0, removed:0, skipped:0, missingDb:0, rpcFailed:0, reason:'' };
@@ -104,76 +149,143 @@ export async function reconcileStateOnly(id, ctx) {
     return out;
   }
 
-  // 2) Lecture DB
+  // 2) Lecture DB + buckets
   const db = await readDbRow(id, withDb);
   if (!db) {
     out.missingDb=1; out.reason='db-missing';
     return out;
   }
+  const { orders, stops } = await readBucketsByPosition(id, withDb);
 
-  // 3) Décisions
-  if (db.state === chainState) {
-    // (0,0) ou (1,1) ou (2,2) ou (3,3) -> rien à faire
-    out.skipped=1; out.reason='in-sync';
+  // 3) États différents → logique habituelle
+  if (db.state !== chainState) {
+    // 0 -> 1
+    if (db.state === 0 && chainState === 1) {
+      const entryX6 = db.entry_x6 !== 0n ? db.entry_x6 : (db.target_x6 !== 0n ? db.target_x6 : 0n);
+      try {
+        if (entryX6 !== 0n) {
+          await withDb(() => handleExecutedEvent({ id, entryX6 }));
+          out.executed++;
+        } else {
+          await patchDbState(id, 1, withDb);
+          out.patched++;
+        }
+        if (db.sl_x6 !== 0n || db.tp_x6 !== 0n) {
+          await withDb(() => handleStopsUpdatedEvent({ id, slX6: db.sl_x6, tpX6: db.tp_x6 }));
+          out.stops++;
+        }
+        out.reason = 'order->open (executed + stops if any)';
+        return out;
+      } catch (e) {
+        out.rpcFailed=1; out.reason = e?.message || String(e);
+        return out;
+      }
+    }
+
+    // 1 -> 2/3
+    if (db.state === 1 && (chainState === 2 || chainState === 3)) {
+      try {
+        await withDb(() => handleRemovedEvent({ id, reason: chainState===3 ? 0 : 1, execX6: 0, pnlUsd6: 0 }));
+        if (chainState === 3) await patchDbState(id, 3, withDb);
+        out.removed++; out.reason = chainState===3 ? 'open->cancelled (clean indexes)' : 'open->closed (clean indexes)';
+        return out;
+      } catch (e) {
+        out.rpcFailed=1; out.reason = e?.message || String(e);
+        return out;
+      }
+    }
+
+    // sinon: patch minimal
+    try {
+      await patchDbState(id, chainState, withDb);
+      out.patched=1; out.reason=`patched ${db.state} -> ${chainState}`;
+    } catch (e) {
+      out.rpcFailed=1; out.reason = e?.message || String(e);
+    }
     return out;
   }
 
-  // ----- Cas clé: ORDER (0) -> OPEN (1) -----
-  if (db.state === 0 && chainState === 1) {
-    // Rejouer "Executed" pour:
-    // - retirer l'index LIMIT
-    // - passer state=1
-    // - (nos handlers le font déjà)
-    // Sans getTrade: on choisit entryX6 depuis DB: entry_x6 sinon target_x6, sinon 0
-    const entryX6 = db.entry_x6 !== 0n ? db.entry_x6 : (db.target_x6 !== 0n ? db.target_x6 : 0n);
-
-    try {
-      if (entryX6 !== 0n) {
-        await withDb(() => handleExecutedEvent({ id, entryX6 }));
-        out.executed++;
-      } else {
-        // Si aucun prix en DB, on bascule l’état au minimum
-        await patchDbState(id, 1, withDb);
-        out.patched++;
+  // 4) États égaux → CONSISTENCY CHECKS
+  // state 2/3 → aucun index résiduel (ORDER/SL/TP/LIQ)
+  if (chainState === 2 || chainState === 3) {
+    if (hasAnyIndex(orders, stops)) {
+      try {
+        await withDb(() => handleRemovedEvent({ id, reason: chainState===3 ? 0 : 1, execX6: 0, pnlUsd6: 0 }));
+        if (chainState === 3) await patchDbState(id, 3, withDb); // par sûreté
+        out.removed++; out.reason = 'closed/cancelled but had indexes → cleaned';
+      } catch (e) {
+        out.rpcFailed=1; out.reason = e?.message || String(e);
       }
+      return out;
+    }
+    out.skipped=1; out.reason='in-sync (closed/cancelled, no indexes)';
+    return out;
+  }
 
-      // Indexer SL/TP antagonistes si non nuls
-      if (db.sl_x6 !== 0n || db.tp_x6 !== 0n) {
+  // state 0 → ORDER doit être indexé correctement
+  if (chainState === 0) {
+    if (!orderIndexedEqual(orders, { lots: db.lots, long_side: db.long_side })) {
+      try {
+        await withDb(() => upsertOpenedEvent({
+          id,
+          state: 0,
+          asset: db.asset_id,
+          longSide: db.long_side,
+          lots: db.lots,
+          entryOrTargetX6: db.target_x6, // pour ORDER c'est target
+          slX6: db.sl_x6,
+          tpX6: db.tp_x6,
+          liqX6: db.liq_x6,
+          trader: db.trader_addr,
+          leverageX: db.leverage_x
+        }));
+        out.executed++; // on compte comme correction d’index (pas un vrai execute)
+        out.reason = 'order indexed (fixed)';
+      } catch (e) {
+        out.rpcFailed=1; out.reason = e?.message || String(e);
+      }
+      return out;
+    }
+    out.skipped=1; out.reason='in-sync (order indexed)';
+    return out;
+  }
+
+  // state 1 → pas d’ORDER, et SL/TP présents si non nuls
+  if (chainState === 1) {
+    // a) ORDER persistant ?
+    if ((orders?.length || 0) > 0) {
+      const entryX6 = db.entry_x6 !== 0n ? db.entry_x6 : (db.target_x6 !== 0n ? db.target_x6 : 0n);
+      try {
+        if (entryX6 !== 0n) {
+          await withDb(() => handleExecutedEvent({ id, entryX6 }));
+        } else {
+          // fallback minimal : patch state=1 (devrait être déjà 1) pour déclencher une ré-index éventuelle côté handlers
+          await patchDbState(id, 1, withDb);
+        }
+        out.executed++; out.reason = 'open had lingering ORDER → cleaned via executed';
+        return out;
+      } catch (e) {
+        out.rpcFailed=1; out.reason = e?.message || String(e);
+        return out;
+      }
+    }
+    // b) SL/TP requis présents ?
+    if (!stopsIndexedOkForOpen(stops, db)) {
+      try {
+        // on ne peut gérer que SL/TP via handleStopsUpdatedEvent (LIQ souvent géré ailleurs)
         await withDb(() => handleStopsUpdatedEvent({ id, slX6: db.sl_x6, tpX6: db.tp_x6 }));
-        out.stops++;
+        out.stops++; out.reason = 'open stops (SL/TP) fixed';
+      } catch (e) {
+        out.rpcFailed=1; out.reason = e?.message || String(e);
       }
-
-      out.reason = 'order->open (executed + stops if any)';
-      return out;
-    } catch (e) {
-      out.rpcFailed=1; out.reason = e?.message || String(e);
       return out;
     }
+    out.skipped=1; out.reason='in-sync (open: no order, stops ok)';
+    return out;
   }
 
-  // ----- Cas: OPEN (1) -> CLOSED/CANCELLED (2/3) -----
-  if (db.state === 1 && (chainState === 2 || chainState === 3)) {
-    try {
-      await withDb(() => handleRemovedEvent({ id, reason: chainState===3 ? 0 : 1, execX6: 0, pnlUsd6: 0 }));
-      if (chainState === 3) {
-        await patchDbState(id, 3, withDb); // passer explicitement à CANCELLED si besoin
-      }
-      out.removed++;
-      out.reason = (chainState===3 ? 'open->cancelled (clean indexes)' : 'open->closed (clean indexes)');
-      return out;
-    } catch (e) {
-      out.rpcFailed=1; out.reason = e?.message || String(e);
-      return out;
-    }
-  }
-
-  // ----- Tous les autres mismatches: patch "state" minimal -----
-  try {
-    await patchDbState(id, chainState, withDb);
-    out.patched=1; out.reason=`patched ${db.state} -> ${chainState}`;
-  } catch (e) {
-    out.rpcFailed=1; out.reason = e?.message || String(e);
-  }
+  // fallback
+  out.skipped=1; out.reason='in-sync';
   return out;
 }
 
@@ -221,7 +333,6 @@ const flags = Object.fromEntries(process.argv.slice(2).map(a => {
   const [k, v='true'] = a.startsWith('--') ? a.slice(2).split('=') : [a, 'true'];
   return [k, v];
 }));
-
 function buildIdsFromFlags(f) {
   if (f.ids) {
     return String(f.ids)
@@ -238,9 +349,7 @@ function buildIdsFromFlags(f) {
   const START = Math.max(0, END - COUNT + 1);
   return Array.from({ length: END - START + 1 }, (_, i) => START + i);
 }
-
 const isDirectRun = import.meta.url === `file://${process.argv[1]}`;
-
 if (isDirectRun) {
   const ids = buildIdsFromFlags(flags);
   const dbConc  = Number(flags.dbConcurrency  ?? flags.db_concurrency  ?? process.env.DB_CONC  ?? 500);
@@ -254,3 +363,4 @@ if (isDirectRun) {
     .then(() => process.exit(0))
     .catch(err => { E(TAG, err?.message || err); process.exit(1); });
 }
+
