@@ -5,7 +5,8 @@ import cors from 'cors';
 
 import { get } from './shared/rest.js';
 import { logInfo, logErr } from './shared/logger.js';
-import { verifyAndSync } from './verify.js';
+import { verifyAndSync, verifyAndSyncFull } from './verify.js';
+
 
 const app = express();
 app.use(cors());
@@ -721,6 +722,61 @@ app.get('/verify/:ids', async (req, res) => {
   } catch (e) {
     logErr('API+/verify', e);
     res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+/* -------------------------------
+   FULL reconcile (getTrade + state)
+   GET /verify/full/:ids
+   Optional query params:
+     - dbConcurrency
+     - rpcConcurrency
+     - workers
+-------------------------------- */
+app.get('/verify/full/:ids', async (req, res) => {
+  try {
+    const raw = String(req.params.ids || '').trim();
+    if (!raw) return bad(res, 'ids_required');
+
+    const ids = Array.from(
+      new Set(
+        raw.split(',')
+           .map(s => s.trim())
+           .filter(Boolean)
+           .map(Number)
+           .filter(n => Number.isInteger(n) && n >= 0)
+      )
+    ).sort((a,b) => a - b);
+
+    if (!ids.length) return bad(res, 'ids_invalid');
+
+    const opts = {
+      dbConcurrency:  req.query.dbConcurrency  ? Number(req.query.dbConcurrency)  : undefined,
+      rpcConcurrency: req.query.rpcConcurrency ? Number(req.query.rpcConcurrency) : undefined,
+      workers:        req.query.workers        ? Number(req.query.workers)        : undefined
+    };
+
+    const r = await verifyAndSyncFull(ids, opts);
+
+    ok(res, {
+      ok: true,
+      mode: 'full',
+      checked: r.checked,
+      created: r.created,
+      executed: r.executed,
+      stops: r.stops,
+      removed: r.removed,
+      statePatched: r.statePatched,
+      skipped: r.skipped
+      // you could also include r.raw for debug, but it's usually noisy
+    });
+  } catch (e) {
+    logErr('API+/verify/full', e?.summary || e);
+    // If verifyAndSyncFull threw with {summary}, surface partial info
+    if (e?.summary) {
+      return res.status(500).json({ ok:false, error:'manual_full_failed', ...e.summary });
+    }
+    res.status(500).json({ ok:false, error:'internal_error' });
   }
 });
 
