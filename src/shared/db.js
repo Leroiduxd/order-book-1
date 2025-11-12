@@ -286,9 +286,6 @@ export async function getHighestPositionId() {
   }
 }
 
-/* =========================================================
-   Get Missing Position IDs (from 0 to MAX(id))
-========================================================= */
 export async function getMissingPositionIds() {
   try {
     const sql = `
@@ -301,8 +298,8 @@ export async function getMissingPositionIds() {
       SELECT p.id FROM public.positions p
       ORDER BY missing_id;
     `;
-    const res = await query(sql);
-    return res.rows.map(r => Number(r.missing_id));
+    const res = await pool.query(sql); // ⬅️ use pool.query to avoid scope issues
+    return res.rows.map(r => Number(r.missing_id)); // or String(...) if >2^53 possible
   } catch (err) {
     console.error('[DB] Error in getMissingPositionIds:', err);
     throw err;
