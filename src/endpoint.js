@@ -187,20 +187,16 @@ app.get('/position/:id', async (req, res) => {
 });
 
 /* -------------------------------
-   Missing Position IDs
-   GET /position/missing
-   -> { count, missing_ids: [...] }
+   Missing IDs (global)
+   GET /missing
+   -> { ok, count, missing_ids: [...] }
 -------------------------------- */
-app.get('/position/missing', async (_req, res) => {
+app.get('/missing', async (_req, res) => {
   try {
     const missing = await getMissingPositionIds();
-    res.json({
-      ok: true,
-      count: missing.length,
-      missing_ids: missing
-    });
+    res.json({ ok: true, count: missing.length, missing_ids: missing });
   } catch (e) {
-    logErr('API+/position/missing', e);
+    logErr('API+/missing', e);
     res.status(500).json({ error: 'internal_error' });
   }
 });
