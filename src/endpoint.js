@@ -6,6 +6,7 @@ import cors from 'cors';
 import { get } from './shared/rest.js';
 import { logInfo, logErr } from './shared/logger.js';
 import { verifyAndSync, verifyAndSyncFull } from './verify.js';
+import { getMissingPositionIds } from './shared/db.js';
 
 
 const app = express();
@@ -184,6 +185,26 @@ app.get('/position/:id', async (req, res) => {
     res.status(500).json({ error: 'internal_error' });
   }
 });
+
+/* -------------------------------
+   Missing Position IDs
+   GET /position/missing
+   -> { count, missing_ids: [...] }
+-------------------------------- */
+app.get('/position/missing', async (_req, res) => {
+  try {
+    const missing = await getMissingPositionIds();
+    res.json({
+      ok: true,
+      count: missing.length,
+      missing_ids: missing
+    });
+  } catch (e) {
+    logErr('API+/position/missing', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
 
 
 /* -------------------------------
