@@ -11,7 +11,7 @@
 // Env (reuse from your project):
 //   RPC_URL / RPC_HTTP        → EVM RPC
 //   CONTRACT_ADDR             → contract address (has nextId())
-//   POSTGREST_URL             → your PostgREST base (same used by shared/rest.js)
+//   POSTGREST_URL (ou ENDPOINT) → base PostgREST (ex: http://127.0.0.1:9304)
 //   BACKFILL_CHUNK_SIZE?      → optional, default 400
 //   DB_PAGE_SIZE?             → optional, default 10000
 // ======================================================================
@@ -19,25 +19,38 @@
 import 'dotenv/config';
 import { spawn } from 'node:child_process';
 import { ethers } from 'ethers';
-import fetch from 'node-fetch';
 
 // ---------- ENV ----------
 const RPC_URL       = (process.env.RPC_URL || process.env.RPC_HTTP || '').trim();
 const CONTRACT_ADDR = (process.env.CONTRACT_ADDR || '').trim();
-const POSTGREST_URL = (process.env.POSTGREST_URL || process.env.REST_URL || process.env.POSTGREST_ENDPOINT || '').trim();
+// Supporte POSTGREST_URL et ENDPOINT (comme shared/rest.js)
+const POSTGREST_URL = (
+  process.env.POSTGREST_URL ||
+  process.env.ENDPOINT ||
+  process.env.REST_URL ||
+  process.env.POSTGREST_ENDPOINT ||
+  'http://127.0.0.1:9304'
+).trim();
+
 if (!RPC_URL)       throw new Error('RPC_URL manquant');
 if (!CONTRACT_ADDR) throw new Error('CONTRACT_ADDR manquant');
-if (!POSTGREST_URL) throw new Error('POSTGREST_URL manquant (ex: http://127.0.0.1:9304)');
 
-const CHUNK = Math.max(1, Number(process.env.BACKFILL_CHUNK_SIZE || 400));
+const CHUNK        = Math.max(1, Number(process.env.BACKFILL_CHUNK_SIZE || 400));
 const DB_PAGE_SIZE = Math.max(1000, Number(process.env.DB_PAGE_SIZE || 10000));
 
 const TAG = 'AutoBackfill';
 
 // ---------- ETHERS (nextId) ----------
 const ABI_NEXTID = [
-  { inputs: [], name: 'nextId', outputs: [{ internalType: 'uint32', name: '', type: 'uint32' }], stateMutability: 'view', type: 'function' }
+  {
+    inputs: [],
+    name: 'nextId',
+    outputs: [{ internalType: 'uint32', name: '', type: 'uint32' }],
+    stateMutability: 'view',
+    type: 'function'
+  }
 ];
+
 const provider = new ethers.JsonRpcProvider(RPC_URL);
 const contract = new ethers.Contract(CONTRACT_ADDR, ABI_NEXTID, provider);
 
@@ -45,8 +58,10 @@ const contract = new ethers.Contract(CONTRACT_ADDR, ABI_NEXTID, provider);
 const log = (...a) => console.log(new Date().toISOString(), `[${TAG}]`, ...a);
 const err = (...a) => console.error(new Date().toISOString(), `[${TAG}]`, ...a);
 
+// GET via PostgREST
 async function pgGet(path) {
-  const url = `${POSTGREST_URL.replace(/\/+$/,'')}/${path.replace(/^\/+/,'')}`;
+  const base = POSTGREST_URL.replace(/\/+$/,'');
+  const url  = `${base}/${String(path).replace(/^\/+/, '')}`;
   const r = await fetch(url, { headers: { Accept: 'application/json' } });
   if (!r.ok) {
     const t = await r.text().catch(()=> '');
@@ -55,6 +70,7 @@ async function pgGet(path) {
   return r.json();
 }
 
+// DB max id
 async function getDbMaxId() {
   const rows = await pgGet('positions?select=id&order=id.desc&limit=1');
   const maxId = rows?.[0]?.id;
@@ -63,8 +79,8 @@ async function getDbMaxId() {
   return Number.isFinite(n) ? n : -1;
 }
 
+// All DB ids (paginé)
 async function getAllDbIds() {
-  // paginate ids ascending
   const seen = new Set();
   for (let offset = 0; ; offset += DB_PAGE_SIZE) {
     const rows = await pgGet(`positions?select=id&order=id.asc&limit=${DB_PAGE_SIZE}&offset=${offset}`);
@@ -73,14 +89,16 @@ async function getAllDbIds() {
       const n = Number(r.id);
       if (Number.isInteger(n)) seen.add(n);
     }
-    if (rows.length < DB_PAGE_SIZE) break;
+    if (rows.length < DB_PAGE_SIZE) break; // dernière page
   }
   return seen;
 }
 
+// Calcule les trous entre [start..maxId] (start=1 si skipZero)
 function computeMissingIds(seen, maxId, { skipZero = true } = {}) {
   const out = [];
   const start = skipZero ? 1 : 0;
+  if (!Number.isInteger(maxId) || maxId < start) return out;
   for (let i = start; i <= maxId; i++) {
     if (!seen.has(i)) out.push(i);
   }
@@ -126,20 +144,22 @@ async function callManualBackfill(idsChunk) {
   const dbMax = await getDbMaxId();
   log(`DB maxId=${dbMax}`);
 
-  // 3) Fetch all DB ids & compute missing up to dbMax
+  // 3) Récupère tous les ids DB & calcule les trous jusqu’à dbMax
   const seen = await getAllDbIds();
   const missingUpToDb = computeMissingIds(seen, dbMax, { skipZero: true });
 
-  // 4) If dbMax < chainMax, add the tail [dbMax+1 .. chainMax]
+  // 4) Si dbMax < chainMax, on ajoute la queue [dbMax+1 .. chainMax]
   let idsToBackfill = [];
   if (dbMax === chainMax) {
     idsToBackfill = missingUpToDb;
-    log(`dbMax === chainMax → only holes: missing=${idsToBackfill.length}`);
+    log(`dbMax === chainMax → uniquement les trous: missing=${idsToBackfill.length}`);
   } else {
     const tailStart = Math.max(1, dbMax + 1);
-    const tail = tailStart <= chainMax ? Array.from({ length: chainMax - tailStart + 1 }, (_, i) => tailStart + i) : [];
+    const tail = tailStart <= chainMax
+      ? Array.from({ length: chainMax - tailStart + 1 }, (_, i) => tailStart + i)
+      : [];
     idsToBackfill = Array.from(new Set([...missingUpToDb, ...tail])).sort((a,b)=>a-b);
-    log(`dbMax(${dbMax}) != chainMax(${chainMax}) → holes + tail. missing=${missingUpToDb.length}, tail=${tail.length}, total=${idsToBackfill.length}`);
+    log(`dbMax(${dbMax}) != chainMax(${chainMax}) → trous + queue. missing=${missingUpToDb.length}, tail=${tail.length}, total=${idsToBackfill.length}`);
   }
 
   if (idsToBackfill.length === 0) {
@@ -149,7 +169,7 @@ async function callManualBackfill(idsChunk) {
 
   // 5) Chunk + call manual_backfill
   const chunks = chunkIds(idsToBackfill, CHUNK);
-  log(`Backfill in ${chunks.length} chunk(s) of ≤ ${CHUNK} ids ...`);
+  log(`Backfill en ${chunks.length} chunk(s) de ≤ ${CHUNK} id ...`);
 
   let fail = 0;
   for (let i = 0; i < chunks.length; i++) {
@@ -158,7 +178,7 @@ async function callManualBackfill(idsChunk) {
     const code = await callManualBackfill(c);
     if (code !== 0) {
       fail++;
-      err(`manual_backfill exited with code=${code} for chunk ${i+1}`);
+      err(`manual_backfill a quitté avec code=${code} pour le chunk ${i+1}`);
     }
   }
 
@@ -170,3 +190,4 @@ async function callManualBackfill(idsChunk) {
   log('Terminé sans erreur. ✅');
   process.exit(0);
 })().catch((e) => { err(e?.message || e); process.exit(1); });
+
