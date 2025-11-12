@@ -272,3 +272,17 @@ export async function handleRemovedEvent(ev) {
 
   logInfo('DB', `Removed id=${idStr(id)} reason=${reason} execX6=${execX6} pnlUsd6=${pnlUsd6}`);
 }
+
+/* =========================================================
+   Get Highest Position ID
+========================================================= */
+export async function getHighestPositionId() {
+  try {
+    const res = await query('SELECT COALESCE(MAX(id), 0) AS max_id FROM public.positions');
+    return BigInt(res.rows[0].max_id); // retourne un BigInt pour cohérence avec ton code
+  } catch (err) {
+    console.error('[DB] Error in getHighestPositionId:', err);
+    throw err;
+  }
+}
+
