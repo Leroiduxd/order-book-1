@@ -274,17 +274,16 @@ export async function handleRemovedEvent(ev) {
 }
 
 /* =========================================================
-   Get Highest Position ID
+   Get Highest Position ID (via PostgREST only)
 ========================================================= */
 export async function getHighestPositionId() {
-  try {
-    const res = await query('SELECT COALESCE(MAX(id), 0) AS max_id FROM public.positions');
-    return BigInt(res.rows[0].max_id); // retourne un BigInt pour cohérence avec ton code
-  } catch (err) {
-    console.error('[DB] Error in getHighestPositionId:', err);
-    throw err;
-  }
+  // Prend la dernière id (ORDER BY id DESC LIMIT 1)
+  const rows = await get('positions?select=id&order=id.desc&limit=1');
+  const id = rows?.[0]?.id;
+  // Retourne -1 si table vide, sinon Number(id)
+  return (id === undefined || id === null) ? -1 : Number(id);
 }
+
 
 /* =========================================================
    Get Missing Position IDs (from 0 to MAX(id)) via PostgREST
