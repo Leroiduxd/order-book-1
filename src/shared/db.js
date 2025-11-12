@@ -287,25 +287,35 @@ export async function getHighestPositionId() {
 }
 
 /* =========================================================
-   Get Missing Position IDs (from 0 to MAX(id))
+   Get Missing Position IDs (from 0 to MAX(id)) via PostgREST
+   - no pg.Pool required
+   - paginates positions ids and computes gaps in Node
 ========================================================= */
 export async function getMissingPositionIds() {
-  try {
-    const sql = `
-      WITH max_id AS (
-        SELECT COALESCE(MAX(id), -1) AS mx FROM public.positions
-      )
-      SELECT s.id AS missing_id
-      FROM generate_series(0, (SELECT mx FROM max_id)) AS s(id)
-      EXCEPT
-      SELECT p.id FROM public.positions p
-      ORDER BY missing_id;
-    `;
-    const res = await pool.query(sql); // ✅ évite toute dépendance à "query"
-    // Si vos IDs peuvent dépasser 2^53, préférez String(...)
-    return res.rows.map(r => Number(r.missing_id));
-  } catch (err) {
-    console.error('[DB] Error in getMissingPositionIds:', err);
-    throw err;
+  // 1) max(id)
+  const maxRows = await get('positions?select=id&order=id.desc&limit=1');
+  const maxId = Number(maxRows?.[0]?.id ?? -1);
+  if (!Number.isInteger(maxId) || maxId < 0) return [];
+
+  // 2) fetch all ids (paginated)
+  const pageSize = 10000;  // ajuste si besoin
+  const seen = new Set();
+
+  for (let offset = 0; ; offset += pageSize) {
+    const rows = await get(`positions?select=id&order=id.asc&limit=${pageSize}&offset=${offset}`);
+    if (!rows || rows.length === 0) break;
+    for (const r of rows) {
+      const n = Number(r.id);
+      if (Number.isInteger(n)) seen.add(n);
+    }
+    if (rows.length < pageSize) break; // dernière page
   }
+
+  // 3) compute gaps [0..maxId]
+  const missing = [];
+  for (let i = 0; i <= maxId; i++) {
+    if (!seen.has(i)) missing.push(i);
+  }
+  return missing;
 }
+
