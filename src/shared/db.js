@@ -286,3 +286,25 @@ export async function getHighestPositionId() {
   }
 }
 
+/* =========================================================
+   Get Missing Position IDs (from 0 to MAX(id))
+========================================================= */
+export async function getMissingPositionIds() {
+  try {
+    const sql = `
+      WITH max_id AS (
+        SELECT COALESCE(MAX(id), -1) AS mx FROM public.positions
+      )
+      SELECT s.id AS missing_id
+      FROM generate_series(0, (SELECT mx FROM max_id)) AS s(id)
+      EXCEPT
+      SELECT p.id FROM public.positions p
+      ORDER BY missing_id;
+    `;
+    const res = await query(sql);
+    return res.rows.map(r => Number(r.missing_id));
+  } catch (err) {
+    console.error('[DB] Error in getMissingPositionIds:', err);
+    throw err;
+  }
+}
