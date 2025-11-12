@@ -168,6 +168,25 @@ app.get('/position/:id', async (req, res) => {
 });
 
 /* -------------------------------
+   Position with highest ID
+   GET /position/max
+   -> { max_id: "123456" }  (null if empty)
+-------------------------------- */
+app.get('/position/max', async (_req, res) => {
+  try {
+    // Fast + index-friendly: use ORDER BY id DESC LIMIT 1
+    const rows = await get('positions?select=id&order=id.desc&limit=1');
+
+    const maxId = rows?.[0]?.id ?? null;  // keep as string to avoid 2^53 issues
+    ok(res, { max_id: maxId === undefined ? null : String(maxId) });
+  } catch (e) {
+    logErr('API+/position/max', e);
+    res.status(500).json({ error: 'internal_error' });
+  }
+});
+
+
+/* -------------------------------
    Trader grouped IDs
 -------------------------------- */
 app.get('/trader/:addr', async (req, res) => {
