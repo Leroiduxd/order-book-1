@@ -633,4 +633,45 @@ end$$;
 -- FIN
 -- =========================================
 
+-- 1) Table pour stocker les meta-transactions signées
+create table if not exists public.meta_signatures (
+  id           bigserial primary key,
+  trader_addr  text,                 -- adresse du trader (en minuscule de préférence)
+  action_type  text not null,        -- "OPEN_MARKET", "OPEN_LIMIT", etc.
+  payload      jsonb not null,       -- le tuple complet signé (n'importe quel JSON)
+  signature    text not null,        -- 0x...
+  tx_hash      text,                 -- optionnel : hash de la tx quand consommée
+  state        smallint not null default 0, -- 0=PENDING, 1=USED, 2=FAILED (par ex.)
+  error_msg    text,                 -- message d'erreur éventuel lors de la conso
+  created_at   timestamptz not null default now(),
+  used_at      timestamptz,
+  failed_at    timestamptz,
+  expires_at   timestamptz           -- optionnel : date limite pour utiliser la sig
+);
+
+-- 2) Index pour requêter par trader + state
+create index if not exists meta_signatures_trader_state_idx
+  on public.meta_signatures(trader_addr, state);
+
+-- 3) Activer la RLS
+alter table public.meta_signatures enable row level security;
+
+-- 4) Policy de lecture publique (comme tes autres tables)
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_policies
+    where schemaname = 'public'
+      and tablename = 'meta_signatures'
+      and policyname = 'read_meta_signatures_public'
+  ) then
+    create policy read_meta_signatures_public
+      on public.meta_signatures
+      for select
+      using (true);
+  end if;
+end$$;
+
+
 
