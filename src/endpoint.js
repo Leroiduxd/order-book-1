@@ -3,7 +3,7 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 
-import { get } from './shared/rest.js';
+import { get, postArray } from './shared/rest.js';
 import { logInfo, logErr } from './shared/logger.js';
 import { verifyAndSync, verifyAndSyncFull } from './verify.js';
 import { getMissingPositionIds } from './shared/db.js';
@@ -815,6 +815,63 @@ app.get('/verify/full/:ids', async (req, res) => {
     res.status(500).json({ ok:false, error:'internal_error' });
   }
 });
+
+/* -------------------------------
+   Enregistrer une meta-tx signée (SANS vérification)
+   POST /meta/submit
+
+   Body JSON attendu :
+   {
+     "action_type": "OPEN_MARKET" | "OPEN_LIMIT" | "CLOSE_MARKET" | ...,
+     "payload": { ... n'importe quel objet ... },
+     "signature": "0x...",
+     "trader": "0x...",        // optionnel, sinon on essaie payload.trader
+     "tx_hash": "0x...",       // optionnel (si déjà connue)
+     "expires_at": "2025-12-31T23:59:59Z" // optionnel
+   }
+-------------------------------- */
+app.post('/meta/submit', async (req, res) => {
+  try {
+    const { action_type, payload, signature, trader, tx_hash, expires_at } = req.body || {};
+
+    if (!action_type || typeof action_type !== 'string') {
+      return bad(res, 'action_type_required', 400);
+    }
+    if (!payload || typeof payload !== 'object') {
+      return bad(res, 'payload_required', 400);
+    }
+    if (!signature || typeof signature !== 'string') {
+      return bad(res, 'signature_required', 400);
+    }
+
+    // On essaie de récupérer l’address trader, sinon null
+    let traderAddr = trader || payload.trader || null;
+    if (typeof traderAddr === 'string') {
+      traderAddr = traderAddr.toLowerCase();
+    }
+
+    // Construire la ligne à insérer dans meta_signatures
+    const row = {
+      trader_addr: traderAddr,              // peut être null
+      action_type,                          // texte libre
+      payload,                              // jsonb
+      signature,                            // texte
+      tx_hash: tx_hash || null,            // texte ou null
+      state: 0,                             // 0 = PENDING (par ex), laissé comme tu l'as défini
+      expires_at: expires_at || null       // timestamptz ou null
+      // created_at, used_at, failed_at, error_msg sont gérés par défaut DB
+    };
+
+    // Insertion via PostgREST
+    await postArray('meta_signatures', [row]);
+
+    return res.json({ ok: true });
+  } catch (e) {
+    logErr('API+/meta/submit', e);
+    return res.status(500).json({ error: 'internal_error' });
+  }
+});
+
 
 
 /* -------------------------------
