@@ -515,3 +515,122 @@ ALTER TABLE public.positions
   ADD CONSTRAINT positions_state_check CHECK (state IN (0,1,2,3));
 
 
+-- =========================================
+-- TABLE: meta_actions (signatures EIP-712)
+-- =========================================
+
+-- 1) Enums pour typer proprement les actions et le statut
+do $$
+begin
+  if not exists (select 1 from pg_type where typname = 'meta_action_type') then
+    create type meta_action_type as enum (
+      'OPEN_MARKET',
+      'CLOSE_MARKET',
+      'OPEN_LIMIT',
+      'CANCEL_ORDER',
+      'SET_SL',
+      'SET_TP',
+      'UPDATE_STOPS'
+    );
+  end if;
+
+  if not exists (select 1 from pg_type where typname = 'meta_action_status') then
+    create type meta_action_status as enum (
+      'PENDING',   -- signé mais pas encore consommé
+      'USED',      -- consommé on-chain (tx OK)
+      'FAILED',    -- tentative on-chain échouée
+      'EXPIRED'    -- deadline dépassée sans exécution
+    );
+  end if;
+end$$;
+
+-- 2) Table principale
+create table if not exists public.meta_actions (
+  id              bigserial primary key,
+
+  -- Type d'action (market/limit/cancel/stops...)
+  action_type     meta_action_type not null,
+
+  -- Adresse du trader (signer)
+  trader          text not null,              -- 0x...
+
+  -- Struct EIP-712 signée (MarketOpen, MarketClose, LimitOrder, etc.)
+  payload         jsonb not null,             -- contient trader, assetId, longSide, leverageX, lots, slX6/tpX6/targetX6, nonce, deadline...
+
+  -- Signature EIP-712 (0x...)
+  signature       text not null,
+
+  -- Suivi d'exécution
+  status          meta_action_status not null default 'PENDING',
+  tx_hash         text,                       -- hash de la tx qui consomme la signature (USED/FAILED)
+  error_message   text,                       -- si FAILED
+
+  -- Validité (deadline du message signé, timestamp uint256)
+  deadline        numeric(20,0) not null,
+
+  -- Optionnel : wallet relayer qui l'a consommée (si tu en as plusieurs)
+  relayer_wallet  text,
+
+  created_at      timestamptz not null default now(),
+  updated_at      timestamptz not null default now(),
+
+  -- Une même signature ne doit pas être stockée deux fois
+  constraint meta_actions_signature_unique unique (signature)
+);
+
+-- 3) Trigger pour updated_at
+create or replace function public.set_meta_actions_updated_at()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.updated_at = now();
+  return new;
+end
+$$;
+
+drop trigger if exists trg_meta_actions_updated_at on public.meta_actions;
+
+create trigger trg_meta_actions_updated_at
+before update on public.meta_actions
+for each row
+execute function public.set_meta_actions_updated_at();
+
+-- 4) Index pour accélérer les requêtes (surtout par trader)
+create index if not exists meta_actions_trader_idx
+  on public.meta_actions(trader);
+
+create index if not exists meta_actions_trader_status_idx
+  on public.meta_actions(trader, status);
+
+create index if not exists meta_actions_status_idx
+  on public.meta_actions(status);
+
+create index if not exists meta_actions_deadline_idx
+  on public.meta_actions(deadline);
+
+create index if not exists meta_actions_action_type_idx
+  on public.meta_actions(action_type);
+
+-- 5) RLS (lecture publique, écriture via service key / backend)
+alter table public.meta_actions enable row level security;
+
+do $$
+begin
+  if not exists (
+    select 1 from pg_policies
+    where schemaname = 'public'
+      and tablename  = 'meta_actions'
+      and policyname = 'read_meta_actions_public'
+  ) then
+    create policy read_meta_actions_public on public.meta_actions
+      for select using (true);
+  end if;
+end$$;
+
+-- (Pas de policy INSERT/UPDATE/DELETE : tu écris depuis ton backend avec la service_key)
+-- =========================================
+-- FIN
+-- =========================================
+
+
